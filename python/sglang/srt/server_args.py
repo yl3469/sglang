@@ -4865,6 +4865,7 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "uniboost",
             ],
             help="The scheduling policy of the requests.",
         )
