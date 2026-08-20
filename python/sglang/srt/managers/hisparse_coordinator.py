@@ -56,6 +56,8 @@ class HiSparseCoordinator:
         tp_group,
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
+        layer_buffer_profile=None,
+        layer_buffer_quantum: int = 256,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -147,6 +149,43 @@ class HiSparseCoordinator:
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
+
+        # Per-layer effective buffer sizes from a pre-solved DP partition
+        # profile (see sparsity/layer_partition.py). The physical layout is
+        # untouched: sizes only bound the LRU region each layer's swap-in
+        # kernel manages. admit_buffer_size (min over layers) replaces
+        # device_buffer_size in the short/long request classification so
+        # the per-layer kernels and the coordinator always agree.
+        from sglang.srt.mem_cache.sparsity.layer_partition import (
+            resolve_layer_buffer_sizes,
+        )
+
+        sizes = resolve_layer_buffer_sizes(
+            layer_buffer_profile,
+            layer_num,
+            self.device_buffer_size,
+            floor=self.top_k,
+            quantum=layer_buffer_quantum,
+        )
+        self.layer_buffer_sizes = (
+            sizes if sizes is not None else [self.device_buffer_size] * layer_num
+        )
+        assert len(self.layer_buffer_sizes) == layer_num
+        assert all(
+            self.top_k <= b <= self.device_buffer_size
+            for b in self.layer_buffer_sizes
+        ), self.layer_buffer_sizes
+        self.admit_buffer_size = min(self.layer_buffer_sizes)
+        if sizes is not None:
+            logger.info(
+                "HiSparse per-layer partition active: mean=%.0f min=%d max=%d "
+                "(physical %d) sizes=%s",
+                sum(sizes) / len(sizes),
+                min(sizes),
+                max(sizes),
+                self.device_buffer_size,
+                sizes,
+            )
         self.req_device_buffer_tokens = torch.full(
             (layer_num, max_num_req_slots, self.padded_buffer_size),
             -1,
@@ -269,7 +308,7 @@ class HiSparseCoordinator:
         self.alloc_device_buffer(req)
 
         host_len = self.host_token_len(req.kv.kv_allocated_len)
-        if host_len <= self.device_buffer_size:
+        if host_len <= self.admit_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
             # must preload all tokens from host pool into the device buffer
@@ -362,7 +401,7 @@ class HiSparseCoordinator:
     ) -> torch.Tensor:
         """Grow device buffers for requests whose sequence length exceeds current capacity."""
         current_caps = self.req_device_buffer_size[req_pool_indices_cpu]
-        short_reqs_cpu = seq_lens_cpu <= self.device_buffer_size
+        short_reqs_cpu = seq_lens_cpu <= self.admit_buffer_size
         needs_grow_cpu = short_reqs_cpu & (seq_lens_cpu > current_caps)
 
         if torch.any(needs_grow_cpu):
@@ -832,7 +871,9 @@ class HiSparseCoordinator:
             lru_slots=self.lru_slots[layer_id],
             item_size_bytes=self.item_size_bytes,
             num_top_k=self.top_k,
-            hot_buffer_size=self.device_buffer_size,
+            hot_buffer_size=self.layer_buffer_sizes[layer_id],
+            fast_len=self.admit_buffer_size,
+            newest_slot=self.device_buffer_size,
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,

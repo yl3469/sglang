@@ -814,6 +814,15 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            # Pre-solved DP partition of the device buffer across layers;
+            # e.g. --hisparse-config '{"layer_buffer_profile":
+            # "dsv4_flash_swe"}'. See mem_cache/sparsity/layer_partition.py.
+            layer_buffer_profile=hisparse_cfg.sparse_extra_config.get(
+                "layer_buffer_profile"
+            ),
+            layer_buffer_quantum=hisparse_cfg.sparse_extra_config.get(
+                "layer_buffer_quantum", 256
+            ),
         )
 
     def post_capture_resize_kv_pool(self):
