@@ -58,6 +58,8 @@ class HiSparseCoordinator:
         swap_in_block_size: int = 960,
         layer_buffer_profile=None,
         layer_buffer_quantum: int = 256,
+        selection_capture_config=None,
+        memory_report_path=None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -225,12 +227,33 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
 
+        # Optional online-profiling hooks (see sparsity/selection_capture.py):
+        # capped per-layer top-k selection capture (rank 0, eager mode only)
+        # and a per-rank report of remaining GPU memory + pool geometry.
+        from sglang.srt.mem_cache.sparsity.selection_capture import (
+            maybe_create_selection_capture,
+            write_memory_report,
+        )
+
+        tp_rank = torch.distributed.get_rank(group=self.tp_group)
+        self.selection_capture = maybe_create_selection_capture(
+            selection_capture_config,
+            layer_num,
+            self.top_k,
+            self.device_buffer_size,
+            rank=tp_rank,
+        )
+        if memory_report_path is not None:
+            write_memory_report(memory_report_path, tp_rank, self)
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
     def destroy(self) -> None:
         # Drain in-flight transfers so the buffer is idle, then unregister it.
         # See HostKVCache.destroy for why the explicit unregister matters.
+        if self.selection_capture is not None:
+            self.selection_capture.flush()
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
         self.mem_pool_host.destroy()
@@ -850,6 +873,11 @@ class HiSparseCoordinator:
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices."""
         num_reqs = req_pool_indices.size(0)
+
+        if self.selection_capture is not None and self.selection_capture.active:
+            self.selection_capture.record(
+                layer_id, req_pool_indices, compressed_seq_lens, top_k_result
+            )
 
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
 

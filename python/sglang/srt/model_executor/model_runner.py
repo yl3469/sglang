@@ -823,7 +823,25 @@ class ModelRunner:
             layer_buffer_quantum=hisparse_cfg.sparse_extra_config.get(
                 "layer_buffer_quantum", 256
             ),
+            # Online DP profiling hooks (sparsity/selection_capture.py):
+            # capped top-k selection capture + per-rank KV memory report.
+            selection_capture_config=hisparse_cfg.sparse_extra_config.get(
+                "selection_capture"
+            ),
+            memory_report_path=hisparse_cfg.sparse_extra_config.get(
+                "memory_report_path"
+            ),
         )
+        if (
+            self.hisparse_coordinator.selection_capture is not None
+            and not self.server_args.disable_cuda_graph
+        ):
+            raise ValueError(
+                "hisparse selection_capture records inside "
+                "swap_in_selected_pages, which is CUDA-graph captured in "
+                "normal serving; run the profiling server with "
+                "--disable-cuda-graph"
+            )
 
     def post_capture_resize_kv_pool(self):
         resize = compute_post_capture_kv_resize(self)
