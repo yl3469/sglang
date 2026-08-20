@@ -181,10 +181,20 @@ struct SmemLayout {
 // IsDsv4Layout selects the miss-copy addressing:
 //   false -> generic byte-stride: device + host both linear, stride = item_size_bytes
 //   true  -> DSv4 page-padded device + page-padded host (kvcacheio.cuh constants)
+// FAST_LEN: fast-path threshold (all tokens resident in order). Equals
+// HOT_BUFFER_SIZE in the uniform-buffer configuration; with per-layer
+// buffer sizes it is the request-admission threshold (min over layers) so
+// the per-layer kernels agree with the coordinator's short/long decision.
+// NEWEST_SLOT: index of the reserved newest-token slot in the physical
+// buffer. Equals HOT_BUFFER_SIZE in the uniform configuration; with
+// per-layer sizes it stays at the physical (max) buffer size for every
+// layer so the coordinator stages the newest token at one position.
 template <
     int BLOCK_SIZE,
     int NUM_TOP_K,
     int HOT_BUFFER_SIZE,
+    int FAST_LEN,
+    int NEWEST_SLOT,
     bool IsMLA,
     bool IsDsv4Layout,
     typename SeqLensT,
@@ -246,7 +256,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
 
   // Fast path: short sequences have all tokens in the device buffer in order.
-  if (seq_len <= HOT_BUFFER_SIZE) {
+  if (seq_len <= FAST_LEN) {
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
       int32_t device_loc = -1;
@@ -299,7 +309,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  const int newest_slot = HOT_BUFFER_SIZE;
+  const int newest_slot = NEWEST_SLOT;
   const int32_t newest_token = seq_len - 1;
 
   // Insert top-k tokens into shared-memory hash table.
@@ -554,7 +564,14 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout>
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int FAST_LEN,
+    int NEWEST_SLOT,
+    bool IsMLA,
+    bool IsDsv4Layout>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -625,6 +642,8 @@ void load_cache_to_device_buffer(
             BLOCK_SIZE,
             NUM_TOP_K,
             HOT_BUFFER_SIZE,
+            FAST_LEN,
+            NEWEST_SLOT,
             IsMLA,
             IsDsv4Layout,
             int64_t,
@@ -637,6 +656,8 @@ void load_cache_to_device_buffer(
             BLOCK_SIZE,
             NUM_TOP_K,
             HOT_BUFFER_SIZE,
+            FAST_LEN,
+            NEWEST_SLOT,
             IsMLA,
             IsDsv4Layout,
             int64_t,
@@ -649,6 +670,8 @@ void load_cache_to_device_buffer(
             BLOCK_SIZE,
             NUM_TOP_K,
             HOT_BUFFER_SIZE,
+            FAST_LEN,
+            NEWEST_SLOT,
             IsMLA,
             IsDsv4Layout,
             int32_t,
@@ -661,6 +684,8 @@ void load_cache_to_device_buffer(
             BLOCK_SIZE,
             NUM_TOP_K,
             HOT_BUFFER_SIZE,
+            FAST_LEN,
+            NEWEST_SLOT,
             IsMLA,
             IsDsv4Layout,
             int32_t,

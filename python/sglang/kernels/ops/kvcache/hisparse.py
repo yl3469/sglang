@@ -17,14 +17,18 @@ def _jit_sparse_module(
     block_size: int,
     num_top_k: int,
     hot_buffer_size: int,
+    fast_len: int,
+    newest_slot: int,
     is_mla: bool = False,
     is_dsv4_layout: bool = False,
 ) -> Module:
     template_args = make_cpp_args(
-        block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
+        block_size, num_top_k, hot_buffer_size, fast_len, newest_slot,
+        is_mla, is_dsv4_layout
     )
     cache_args = make_cpp_args(
-        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
+        item_size_bytes, block_size, num_top_k, hot_buffer_size, fast_len,
+        newest_slot, is_mla, is_dsv4_layout
     )
     return load_jit(
         "sparse_cache",
@@ -91,16 +95,29 @@ def _load_cache_to_device_buffer_mla(
     page_size: int,
     block_size: int,
     num_real_reqs: torch.Tensor | None,
+    fast_len: int | None = None,
+    newest_slot: int | None = None,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    # Uniform-buffer defaults: fast path and the reserved newest-token slot
+    # both sit at the buffer size. Per-layer buffer configurations pass an
+    # explicit request-admission threshold and the physical newest position.
+    if fast_len is None:
+        fast_len = hot_buffer_size
+    if newest_slot is None:
+        newest_slot = hot_buffer_size
+    assert fast_len <= hot_buffer_size, (fast_len, hot_buffer_size)
+    assert newest_slot >= hot_buffer_size, (newest_slot, hot_buffer_size)
 
     module = _jit_sparse_module(
         item_size_bytes,
         block_size,
         num_top_k,
         hot_buffer_size,
+        fast_len,
+        newest_slot,
         is_mla=True,
         is_dsv4_layout=is_dsv4_layout,
     )
@@ -148,6 +165,8 @@ def load_cache_to_device_buffer_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    fast_len: int | None = None,
+    newest_slot: int | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -168,6 +187,8 @@ def load_cache_to_device_buffer_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        fast_len=fast_len,
+        newest_slot=newest_slot,
     )
 
 
@@ -188,6 +209,8 @@ def load_cache_to_device_buffer_dsv4_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    fast_len: int | None = None,
+    newest_slot: int | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -208,4 +231,6 @@ def load_cache_to_device_buffer_dsv4_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        fast_len=fast_len,
+        newest_slot=newest_slot,
     )
