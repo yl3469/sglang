@@ -54,13 +54,21 @@ class HiSparseCoordinator:
         device_buffer_size: int,
         device: str,
         tp_group,
+        device_buffer_sizes: Union[List[int], None] = None,
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
+        # ``device_buffer_size`` is the PHYSICAL buffer width (== max per-layer
+        # capacity); it sizes every buffer tensor and the reserved-slot index.
+        # ``device_buffer_sizes`` (set later, once layer_num is known) holds the
+        # per-layer LOGICAL capacity B_l handed to the kernel; when no per-layer
+        # config is given every layer uses the scalar and behavior is identical
+        # to the original single-B implementation.
         self.device_buffer_size = device_buffer_size
+        self._device_buffer_sizes_config = device_buffer_sizes
         self.device = device
         self.swap_in_block_size = swap_in_block_size
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
@@ -147,6 +155,48 @@ class HiSparseCoordinator:
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
+
+        # Resolve the per-layer LOGICAL device buffer capacities B_l. When no
+        # per-layer config was supplied, every layer uses the scalar capacity
+        # (identical to the original single-B behavior). When supplied, its
+        # length must match the HiSparse layer count and each B_l must fit
+        # within the physical width and be >= top_k.
+        if self._device_buffer_sizes_config is None:
+            self.device_buffer_sizes: List[int] = [self.device_buffer_size] * layer_num
+        else:
+            sizes = list(self._device_buffer_sizes_config)
+            if len(sizes) != layer_num:
+                raise ValueError(
+                    f"device_buffer_sizes has {len(sizes)} entries but HiSparse "
+                    f"has {layer_num} indexer layers"
+                )
+            for b in sizes:
+                if b < self.top_k:
+                    raise ValueError(
+                        f"per-layer device buffer size {b} < top_k ({self.top_k})"
+                    )
+                if b > self.device_buffer_size:
+                    raise ValueError(
+                        f"per-layer device buffer size {b} exceeds physical width "
+                        f"({self.device_buffer_size})"
+                    )
+            self.device_buffer_sizes = sizes
+        self.layer_num = layer_num
+        # When every layer shares one capacity we can keep the original single
+        # broadcast write (fast path, provably identical to stock). The reserved
+        # slot for a layer lives at column B_l, so the shared column is B_l[0].
+        self._uniform_buffer = len(set(self.device_buffer_sizes)) == 1
+        self._reserved_col_uniform = self.device_buffer_sizes[0]
+        logger.info(
+            "HiSparse per-layer device buffer sizes: min=%d max=%d mean=%d "
+            "(physical width=%d, uniform=%s)",
+            min(self.device_buffer_sizes),
+            max(self.device_buffer_sizes),
+            sum(self.device_buffer_sizes) // len(self.device_buffer_sizes),
+            self.device_buffer_size,
+            self._device_buffer_sizes_config is None,
+        )
+
         self.req_device_buffer_tokens = torch.full(
             (layer_num, max_num_req_slots, self.padded_buffer_size),
             -1,
@@ -458,6 +508,28 @@ class HiSparseCoordinator:
             ready_reqs.append(req)
         return ready_reqs
 
+    def _write_reserved_token_locs(
+        self, req_indices: torch.Tensor, reserved_buffer_loc: torch.Tensor
+    ) -> None:
+        """Point each layer's reserved (newest-token) slot at ``reserved_buffer_loc``.
+
+        The swap-in kernel places the newest token at column ``B_l`` of layer
+        ``l``'s buffer row (``newest_slot == HOT_BUFFER_SIZE``). With a uniform
+        capacity every layer shares column ``B`` and we keep the original single
+        broadcast write. With per-layer capacities each layer's reserved column
+        differs, so we scatter per layer at column ``B_l``.
+        """
+        loc_i32 = reserved_buffer_loc.to(torch.int32)
+        if self._uniform_buffer:
+            self.req_device_buffer_token_locs[
+                :, req_indices, self._reserved_col_uniform
+            ] = loc_i32
+        else:
+            for layer_id in range(self.layer_num):
+                self.req_device_buffer_token_locs[
+                    layer_id, req_indices, self.device_buffer_sizes[layer_id]
+                ] = loc_i32
+
     def map_last_loc_to_buffer(
         self,
         seq_lens: torch.Tensor,
@@ -475,9 +547,7 @@ class HiSparseCoordinator:
             reserved_buffer_loc = self._grow_device_buffers(
                 seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
             )
-            self.req_device_buffer_token_locs[
-                :, req_pool_indices, self.device_buffer_size
-            ] = reserved_buffer_loc.to(torch.int32)
+            self._write_reserved_token_locs(req_pool_indices, reserved_buffer_loc)
 
             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
                 out_cache_loc
@@ -519,9 +589,7 @@ class HiSparseCoordinator:
             active_req_pool_indices, reserved_positions
         ]
 
-        self.req_device_buffer_token_locs[
-            :, active_req_pool_indices, self.device_buffer_size
-        ] = reserved_buffer_loc.to(torch.int32)
+        self._write_reserved_token_locs(active_req_pool_indices, reserved_buffer_loc)
 
         compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
             active_out_cache_loc
@@ -832,7 +900,7 @@ class HiSparseCoordinator:
             lru_slots=self.lru_slots[layer_id],
             item_size_bytes=self.item_size_bytes,
             num_top_k=self.top_k,
-            hot_buffer_size=self.device_buffer_size,
+            hot_buffer_size=self.device_buffer_sizes[layer_id],
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,

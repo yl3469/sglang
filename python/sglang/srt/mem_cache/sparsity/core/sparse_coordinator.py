@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
@@ -57,6 +57,12 @@ class SparseConfig:
 
     top_k: int = 2048
     device_buffer_size: int = 4096
+    # Optional per-layer device buffer sizes (one entry per HiSparse indexer
+    # layer). When set, HiSparse gives each layer its own GPU buffer capacity
+    # B_l instead of the single scalar ``device_buffer_size`` (which then only
+    # sizes the physical tensors / reserved slot at MAX(B_l)). Consumed by
+    # HiSparseCoordinator; length is validated against the layer count there.
+    device_buffer_sizes: Optional[List[int]] = None
     host_to_device_ratio: int = 2
     swap_in_block_size: int = 960
     algorithm: Optional[str] = None
