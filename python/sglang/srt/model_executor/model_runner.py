@@ -1095,6 +1095,7 @@ class ModelRunner:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             top_k=hisparse_top_k,
             device_buffer_size=hisparse_cfg.device_buffer_size,
+            device_buffer_sizes=hisparse_cfg.device_buffer_sizes,
             device=self.device,
             tp_group=get_dp_tp_group().cpu_group,
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
