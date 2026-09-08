@@ -48,7 +48,7 @@ def parse_server_info(info: dict) -> Dict[str, object]:
     """Pull KV-budget fields out of a /server_info JSON payload."""
     states = _extract_internal_states(info)
     token_caps: List[int] = []
-    kvcache_bytes: List[float] = []
+    kvcache_gb: List[float] = []
     startup_gpu_gb: List[float] = []
     max_total: List[int] = []
     for st in states:
@@ -56,12 +56,15 @@ def parse_server_info(info: dict) -> Dict[str, object]:
         if isinstance(mem.get("token_capacity"), (int, float)):
             token_caps.append(int(mem["token_capacity"]))
         if isinstance(mem.get("kvcache"), (int, float)):
-            kvcache_bytes.append(float(mem["kvcache"]))
+            kvcache_gb.append(float(mem["kvcache"]))
         if isinstance(st.get("max_total_num_tokens"), (int, float)):
             max_total.append(int(st["max_total_num_tokens"]))
         if isinstance(st.get("startup_available_gpu_memory_gb"), (int, float)):
             startup_gpu_gb.append(float(st["startup_available_gpu_memory_gb"]))
 
+    # Schema: *_per_dp keys hold one entry per DP rank, in rank order; scalar
+    # keys are the min across ranks (the safe shared budget). Token counts are
+    # compressed KV slots; *_gb values are GB as reported by /server_info.
     out: Dict[str, object] = {}
     if token_caps:
         out["per_dp_token_capacity"] = token_caps
@@ -69,8 +72,8 @@ def parse_server_info(info: dict) -> Dict[str, object]:
         out["token_capacity"] = min(token_caps)
     if max_total:
         out["max_total_num_tokens"] = min(max_total)
-    if kvcache_bytes:
-        out["kvcache_gb_per_dp"] = kvcache_bytes
+    if kvcache_gb:
+        out["kvcache_gb_per_dp"] = kvcache_gb
     if startup_gpu_gb:
         out["startup_available_gpu_memory_gb"] = min(startup_gpu_gb)
     out["num_dp"] = len(states)

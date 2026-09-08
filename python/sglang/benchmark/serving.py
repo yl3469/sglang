@@ -73,15 +73,18 @@ def _create_bench_client_session():
     # the content. We increase the read_bufsize from 64K to 10M.
     # Define constants for timeout and buffer size for clarity and maintainability
     BENCH_AIOHTTP_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours
+    BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 10 * 1024**2  # 10 MB
     # A single SSE "data:" line can be very large when the response carries a
-    # base64 side-channel payload (e.g. meta_info["indexer_topk"] for HiSparse
+    # base64 side-channel payload (meta_info["indexer_topk"] for HiSparse
     # trace capture: steps x num_indexer_layers x index_topk int32, base64'd).
     # `async for line in response.content` -> StreamReader.readuntil, whose line
     # cap is `self._high_water == 2 * read_bufsize` (NOT max_line_size, which is
     # header-only). The default 10 MB bufsize -> 20 MB line cap -> LineTooLong on
-    # long-context traces. Raise read_bufsize so the cap comfortably fits the
-    # largest cumulative SSE event.
-    BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 1024 * 1024**2  # 1 GB (-> 2 GB line cap)
+    # long-context traces, so raise read_bufsize ONLY when trace capture is on;
+    # every other benchmark keeps the stock buffer. getattr: `args` may be an
+    # external namespace (set_global_args) that predates the flag.
+    if getattr(globals().get("args"), "indexer_trace_out", None):
+        BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 1024 * 1024**2  # 1 GB (-> 2 GB cap)
 
     aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
     return aiohttp.ClientSession(

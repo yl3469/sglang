@@ -69,6 +69,18 @@ class TestFactoryParse(CustomTestCase):
             )
         self.assertEqual(c.device_buffer_sizes, [640, 512])
 
+    def test_path_wrong_schema_raises(self):
+        # A file that exists but lacks the expected key must fail loudly, not
+        # silently fall back to the uniform path with the feature disabled.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "b.json")
+            with open(p, "w") as f:
+                json.dump({"buffer_sizes": [640, 512]}, f)  # wrong key
+            with self.assertRaisesRegex(ValueError, "does not contain"):
+                _parse_sparse_config(
+                    _FakeArgs(json.dumps({"top_k": 512, "device_buffer_sizes_path": p}))
+                )
+
     def test_below_topk_raises(self):
         with self.assertRaises(ValueError):
             _parse_sparse_config(

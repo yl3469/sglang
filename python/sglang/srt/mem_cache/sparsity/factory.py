@@ -93,6 +93,14 @@ def _parse_sparse_config(server_args) -> SparseConfig:
             loaded = json.load(f)
         if isinstance(loaded, dict):
             loaded = loaded.get("device_buffer_sizes")
+        if loaded is None:
+            # Fail loudly: a typo or wrong schema must not silently fall back
+            # to the uniform path with the per-layer feature disabled.
+            raise ValueError(
+                f"{device_buffer_sizes_path} does not contain per-layer buffer "
+                'sizes; expected a bare JSON list or {"device_buffer_sizes": '
+                "[...]}"
+            )
         device_buffer_sizes = loaded
     if device_buffer_sizes is not None:
         if (
