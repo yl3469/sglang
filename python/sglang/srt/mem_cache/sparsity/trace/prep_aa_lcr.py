@@ -147,12 +147,11 @@ def _select(
         expected = len(
             [f for f in row.get("data_source_filenames", "").split(";") if f.strip()]
         )
-        if found == 0 or found < expected:
+        if found < expected:
             # Partial/empty document set -> the prompt would silently misrepresent
             # the context length; skip it rather than bias the trace.
             skipped_missing += 1
-            if found == 0:
-                continue
+            continue
         n = estimate_tokens(prompt, tokenizer)
         if n < min_tokens or (max_tokens > 0 and n > max_tokens):
             continue
