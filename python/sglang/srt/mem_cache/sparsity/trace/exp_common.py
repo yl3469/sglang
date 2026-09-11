@@ -197,6 +197,11 @@ class Server(msgspec.Struct, kw_only=True):
         ]
         if self.dp > 1:
             cmd.append("--enable-dp-attention")
+        # Optional loader tuning (e.g. multithreaded safetensors reads from a
+        # parallel filesystem); same JSON as --model-loader-extra-config.
+        loader_extra = os.environ.get("MODEL_LOADER_EXTRA_CONFIG")
+        if loader_extra:
+            cmd += ["--model-loader-extra-config", loader_extra]
         cmd += list(self.extra_flags)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         log(f"launching server: {shlex.join(cmd)}")
