@@ -74,6 +74,17 @@ def _create_bench_client_session():
     # Define constants for timeout and buffer size for clarity and maintainability
     BENCH_AIOHTTP_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours
     BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 10 * 1024**2  # 10 MB
+    # A single SSE "data:" line can be very large when the response carries a
+    # base64 side-channel payload (meta_info["indexer_topk"] for HiSparse
+    # trace capture: steps x num_indexer_layers x index_topk int32, base64'd).
+    # `async for line in response.content` -> StreamReader.readuntil, whose line
+    # cap is `self._high_water == 2 * read_bufsize` (NOT max_line_size, which is
+    # header-only). The default 10 MB bufsize -> 20 MB line cap -> LineTooLong on
+    # long-context traces, so raise read_bufsize ONLY when trace capture is on;
+    # every other benchmark keeps the stock buffer. getattr: `args` may be an
+    # external namespace (set_global_args) that predates the flag.
+    if getattr(globals().get("args"), "indexer_trace_out", None):
+        BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 1024 * 1024**2  # 1 GB (-> 2 GB cap)
 
     aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
     return aiohttp.ClientSession(
@@ -113,6 +124,9 @@ class RequestFuncOutput:
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
+    # Base64 int32 indexer topk payload from meta_info (HiSparse trace capture);
+    # only populated when the server returns it (return_indexer_topk=true).
+    indexer_topk_b64: Optional[str] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -729,6 +743,10 @@ async def async_request_sglang_generate(
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
                                 ]
+                            # HiSparse indexer topk trace (base64 int32); keep
+                            # the latest non-empty payload seen for this request.
+                            if _meta_info.get("indexer_topk"):
+                                output.indexer_topk_b64 = _meta_info["indexer_topk"]
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -1543,6 +1561,28 @@ async def benchmark(
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
+
+    # HiSparse indexer topk trace sink (opt-in via --indexer-trace-out). No-op
+    # unless the flag is set; isolated in the sparsity trace subpackage.
+    if getattr(args, "indexer_trace_out", None):
+        from sglang.srt.mem_cache.sparsity.trace.indexer_trace_sink import (
+            IndexerTraceSink,
+        )
+
+        sink = IndexerTraceSink(
+            out_dir=args.indexer_trace_out,
+            num_indexer_layers=getattr(args, "indexer_num_layers", None),
+            index_topk=getattr(args, "indexer_topk", None),
+        )
+        for req_idx, out in enumerate(outputs):
+            if getattr(out, "indexer_topk_b64", None):
+                sink.capture(
+                    req_idx=req_idx,
+                    meta_info={"indexer_topk": out.indexer_topk_b64},
+                    prompt_len=out.prompt_len,
+                    output_len=out.output_len,
+                )
+        print(sink.summary())
 
     # Stop profiler (only if profile_steps was not provided, as it auto-stops)
     if profile and not (
@@ -2417,6 +2457,28 @@ def cli_main():
         "--return-routed-experts",
         action="store_true",
         help="Return routed experts.",
+    )
+    parser.add_argument(
+        "--indexer-trace-out",
+        type=str,
+        default=None,
+        help="Directory to persist per-request HiSparse indexer topk traces "
+        "(req_<i>.npz). Requires the server to be launched with "
+        "--enable-return-indexer-topk and requests to set "
+        "return_indexer_topk=true (via --extra-request-body). No-op when unset.",
+    )
+    parser.add_argument(
+        "--indexer-num-layers",
+        type=int,
+        default=None,
+        help="num_indexer_layers, used to reshape captured topk traces. If "
+        "unset, the flat buffer is stored and reshaped offline.",
+    )
+    parser.add_argument(
+        "--indexer-topk",
+        type=int,
+        default=None,
+        help="index_topk width, used to reshape captured topk traces.",
     )
     parser.add_argument(
         "--cache-report",

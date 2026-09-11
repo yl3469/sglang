@@ -80,6 +80,47 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
     swap_in_block_size = extra_config.pop("swap_in_block_size", 960)
 
+    # Optional per-layer device buffer sizes. Either an inline list
+    # ("device_buffer_sizes": [B0, B1, ...]) or a path to a JSON file
+    # ("device_buffer_sizes_path": "/path/to/buffer_sizes.json") whose content
+    # is either a bare list or {"device_buffer_sizes": [...]}. When provided,
+    # HiSparse uses per-layer capacities and ``device_buffer_size`` is treated
+    # as the physical MAX (raised to max(B_l) if smaller).
+    device_buffer_sizes = extra_config.pop("device_buffer_sizes", None)
+    device_buffer_sizes_path = extra_config.pop("device_buffer_sizes_path", None)
+    if device_buffer_sizes is None and device_buffer_sizes_path is not None:
+        with open(device_buffer_sizes_path) as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            loaded = loaded.get("device_buffer_sizes")
+        if loaded is None:
+            # Fail loudly: a typo or wrong schema must not silently fall back
+            # to the uniform path with the per-layer feature disabled.
+            raise ValueError(
+                f"{device_buffer_sizes_path} does not contain per-layer buffer "
+                'sizes; expected a bare JSON list or {"device_buffer_sizes": '
+                "[...]}"
+            )
+        device_buffer_sizes = loaded
+    if device_buffer_sizes is not None:
+        if (
+            not isinstance(device_buffer_sizes, (list, tuple))
+            or not device_buffer_sizes
+        ):
+            raise ValueError(
+                f"device_buffer_sizes must be a non-empty list, got "
+                f"{device_buffer_sizes!r}"
+            )
+        device_buffer_sizes = [int(b) for b in device_buffer_sizes]
+        for b in device_buffer_sizes:
+            if b < top_k:
+                raise ValueError(
+                    f"every per-layer device buffer size must be >= top_k "
+                    f"({top_k}); got {b} in {device_buffer_sizes}"
+                )
+        # Physical tensors / reserved slot are sized at the max per-layer cap.
+        device_buffer_size = max(device_buffer_size, max(device_buffer_sizes))
+
     if device_buffer_size < top_k:
         raise ValueError(
             f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
@@ -101,6 +142,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     return SparseConfig(
         top_k=top_k,
         device_buffer_size=device_buffer_size,
+        device_buffer_sizes=device_buffer_sizes,
         host_to_device_ratio=host_to_device_ratio,
         swap_in_block_size=swap_in_block_size,
         algorithm=algorithm,
