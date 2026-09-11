@@ -4,8 +4,10 @@ agent traces; prompts reconstructed from hash_ids so prefix-cache reuse
 structure is preserved).
 
 Differences vs the swebench sweep:
-* bench client is aiperf (InferenceX utils/aiperf checkout, .venv-cc), not
-  sglang.benchmark.serving;
+* bench client is aiperf (>= 0.13; upstream ships the
+  ``semianalysis_cc_traces_weka_062126`` alias and the
+  ``inferencex-agentx-mvp`` scenario), not sglang.benchmark.serving. Default
+  binary: ``<SGLANG_DIR>/.venv-aiperf/bin/aiperf`` (override with AIPERF_BIN);
 * radix cache stays DISABLED on every arm: HiSparse hard-requires
   --disable-radix-cache (arg_groups/hisparse_hook.py validate_hisparse), so a
   matched A/B cannot enable it. The dataset's prefix-reuse structure is still
@@ -17,8 +19,13 @@ Differences vs the swebench sweep:
 Modes:
   smoke: 1 arm (uniform by default), 3 traces, fixed-schedule replay of the
          first 2 minutes of each trace, no scenario. Proves the pipeline.
-  full:  arms dense/uniform/dp, scenario inferencex-agentx-mvp,
-         --benchmark-duration 900, fixed seed, same traces for every arm.
+  full:  arms dense/uniform/dp, scenario inferencex-agentx-mvp, FULL corpus
+         (393 traces; NUM_TRACES=0 omits --num-dataset-entries, which the
+         AgentX tutorial reserves for smoke tests), --benchmark-duration 1800
+         (the scenario default; 900 is the enforced minimum), fixed seed, same
+         traces for every arm. Everything else the scenario locks (streaming,
+         ignore_eos, first-turn-prefix cache bust, 10 s system idle-gap cap,
+         no per-trace delay caps) is auto-filled by aiperf.
 
     .venv/bin/python -m sglang.srt.mem_cache.sparsity.trace.run_cctraces_aiperf --mode smoke
 """
@@ -32,12 +39,12 @@ from pathlib import Path
 
 from . import exp_common as ec
 
-DEFAULT_AIPERF = (
-    "/scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/"
-    "yueyingl/ai-horizon/Inference-Agent-Opt/InferenceX/utils/aiperf/"
-    ".venv-cc/bin/aiperf"
-)
+DEFAULT_AIPERF = str(ec.SGLANG_DIR / ".venv-aiperf/bin/aiperf")
 DATASET_ALIAS = "semianalysis_cc_traces_weka_062126"
+# Cold full-corpus reconstruction can exceed aiperf's 300 s configuration
+# timeout (agentx-mvp tutorial, "Configuration times out"); the tutorial's
+# recommended ceiling for a cold run.
+AIPERF_CONFIGURE_TIMEOUT_S = "1800"
 
 
 def run_aiperf(args, arm_dir: Path, base_url: str) -> int:
@@ -57,8 +64,12 @@ def run_aiperf(args, arm_dir: Path, base_url: str) -> int:
         "--use-server-token-count",
         "--public-dataset",
         DATASET_ALIAS,
-        "--num-dataset-entries",
-        str(args.num_traces),
+    ]
+    if args.num_traces > 0:
+        # Smoke only: the AgentX tutorial says a reduced corpus is "never for
+        # runs you intend to compare"; full mode replays all 393 traces.
+        cmd += ["--num-dataset-entries", str(args.num_traces)]
+    cmd += [
         "--max-context-length",
         str(args.max_context_length),
         "--concurrency",
@@ -88,6 +99,10 @@ def run_aiperf(args, arm_dir: Path, base_url: str) -> int:
         ]
     env = dict(os.environ)
     env.setdefault("HF_DATASETS_OFFLINE", "1")
+    env.setdefault("AIPERF_DATASET_CONFIGURATION_TIMEOUT", AIPERF_CONFIGURE_TIMEOUT_S)
+    env.setdefault(
+        "AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT", AIPERF_CONFIGURE_TIMEOUT_S
+    )
     # datasets-lib cache: the corpus was pre-downloaded on a login node with
     # cache_dir=<hf_cache root>, which is NOT the default $HF_HOME/datasets.
     env["HF_DATASETS_CACHE"] = args.hf_cache
@@ -191,9 +206,9 @@ def main() -> None:
         args.benchmark_duration = args.benchmark_duration or 300
     else:
         args.arms = args.arms or "dense uniform dp"
-        args.num_traces = args.num_traces or 40
+        # num_traces stays 0 -> full corpus (AgentX methodology).
         args.concurrency = args.concurrency or 8
-        args.benchmark_duration = args.benchmark_duration or 900
+        args.benchmark_duration = args.benchmark_duration or 1800
 
     ec.setup_environment(args.hf_cache)
     ec.require_file(args.dp_csv, "dp csv")
