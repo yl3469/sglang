@@ -28,6 +28,9 @@ _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
+# Swap-in kernel and LRU bookkeeping index buffer slots 0..B-1 with int16.
+_MAX_DEVICE_BUFFER_SIZE = 32768
+
 
 class HiSparseAct(NamedTuple):
     start_event: device_module.Event
@@ -120,6 +123,13 @@ class HiSparseCoordinator:
             max_context_len + self.compress_ratio - 1
         ) // self.compress_ratio
 
+        # LRU slot indices (lru_slots, _lru_init, the swap-in kernel's int16_t*)
+        # are int16, so the physical buffer width is capped at 32768 slots.
+        if self.device_buffer_size > _MAX_DEVICE_BUFFER_SIZE:
+            raise ValueError(
+                f"HiSparse device_buffer_size {self.device_buffer_size} exceeds "
+                f"{_MAX_DEVICE_BUFFER_SIZE} (int16 LRU slot indices)"
+            )
         # to have an extra page for new tokens
         self.padded_buffer_size = (
             self.device_buffer_size + self.mem_pool_device.page_size
@@ -187,6 +197,13 @@ class HiSparseCoordinator:
         # slot for a layer lives at column B_l, so the shared column is B_l[0].
         self._uniform_buffer = len(set(self.device_buffer_sizes)) == 1
         self._reserved_col_uniform = self.device_buffer_sizes[0]
+        # Per-layer reserved columns as device tensors so the non-uniform write
+        # in _write_reserved_token_locs is one indexed scatter, not a Python
+        # loop of layer_num launches per decode step.
+        self._reserved_cols = torch.tensor(
+            self.device_buffer_sizes, dtype=torch.int64, device=device
+        )
+        self._layer_index = torch.arange(layer_num, dtype=torch.int64, device=device)
         logger.info(
             "HiSparse per-layer device buffer sizes: min=%d max=%d mean=%d "
             "(physical width=%d, uniform=%s)",
@@ -517,7 +534,8 @@ class HiSparseCoordinator:
         ``l``'s buffer row (``newest_slot == HOT_BUFFER_SIZE``). With a uniform
         capacity every layer shares column ``B`` and we keep the original single
         broadcast write. With per-layer capacities each layer's reserved column
-        differs, so we scatter per layer at column ``B_l``.
+        differs, so we scatter all layers at their columns ``B_l`` in one
+        indexed write (shape ``(layer_num, len(req_indices))``).
         """
         loc_i32 = reserved_buffer_loc.to(torch.int32)
         if self._uniform_buffer:
@@ -525,10 +543,11 @@ class HiSparseCoordinator:
                 :, req_indices, self._reserved_col_uniform
             ] = loc_i32
         else:
-            for layer_id in range(self.layer_num):
-                self.req_device_buffer_token_locs[
-                    layer_id, req_indices, self.device_buffer_sizes[layer_id]
-                ] = loc_i32
+            self.req_device_buffer_token_locs[
+                self._layer_index[:, None],
+                req_indices[None, :],
+                self._reserved_cols[:, None],
+            ] = loc_i32[None, :]
 
     def map_last_loc_to_buffer(
         self,

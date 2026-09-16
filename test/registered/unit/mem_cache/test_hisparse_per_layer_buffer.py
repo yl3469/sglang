@@ -122,6 +122,8 @@ class _ResolveShim:
         self._uniform_buffer = len(set(self.device_buffer_sizes)) == 1
         self._reserved_col_uniform = self.device_buffer_sizes[0]
         padded = device_buffer_size + 4  # + page_size
+        if device_buffer_size > 32768:  # int16 LRU slot indices 0..B-1
+            raise ValueError("exceeds int16 slot range")
         self.req_device_buffer_token_locs = torch.full(
             (layer_num, 8, padded), -1, dtype=torch.int32
         )
@@ -134,11 +136,14 @@ class _ResolveShim:
                 :, req_indices, self._reserved_col_uniform
             ] = loc_i32
         else:
-            for layer_id in range(self.layer_num):
-                self.req_device_buffer_token_locs[
-                    layer_id, req_indices, self.device_buffer_sizes[layer_id]
-                ] = loc_i32
+            self.req_device_buffer_token_locs[
+                self._layer_index[:, None],
+                req_indices[None, :],
+                self._reserved_cols[:, None],
+            ] = loc_i32[None, :]
 
+        self._reserved_cols = torch.tensor(self.device_buffer_sizes, dtype=torch.int64)
+        self._layer_index = torch.arange(layer_num, dtype=torch.int64)
 
 class TestResolveAndReservedWrite(CustomTestCase):
     def test_none_gives_uniform(self):
@@ -168,6 +173,12 @@ class TestResolveAndReservedWrite(CustomTestCase):
         ref[:, req, dbs] = loc
         self.assertTrue(torch.equal(s.req_device_buffer_token_locs, ref))
 
+    def test_width_above_int16_raises(self):
+        # LRU slots are int16 on both host bookkeeping and the swap-in kernel.
+        with self.assertRaises(ValueError):
+            _ResolveShim(32768 + 64, 2048, 4, None)
+        _ResolveShim(32768, 2048, 4, None)  # slots 0..32767 fit int16
+
     def test_per_layer_write_targets_correct_columns(self):
         sizes = [512, 768, 1024]
         s = _ResolveShim(1024, 512, 3, sizes)
@@ -188,3 +199,22 @@ class TestResolveAndReservedWrite(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    def test_per_layer_vectorized_write_matches_loop(self):
+        # The single indexed scatter must write exactly what the original
+        # per-layer Python loop wrote, and nothing else.
+        sizes = [512, 768, 1024, 640]
+        s = _ResolveShim(1024, 512, len(sizes), sizes)
+        self.assertFalse(s._uniform_buffer)
+        req = torch.tensor([0, 3, 4, 7], dtype=torch.int64)
+        loc = torch.randint(0, 1 << 20, (len(req),), dtype=torch.int32)
+        s.write_reserved(req, loc)
+
+        ref = torch.full_like(s.req_device_buffer_token_locs, -1)
+        for layer_id, b in enumerate(sizes):
+            ref[layer_id, req, b] = loc
+        self.assertTrue(torch.equal(s.req_device_buffer_token_locs, ref))
+        # Exactly layer_num * len(req) cells were written.
+        self.assertEqual(
+            int((s.req_device_buffer_token_locs != -1).sum()), len(sizes) * len(req)
+        )
+
