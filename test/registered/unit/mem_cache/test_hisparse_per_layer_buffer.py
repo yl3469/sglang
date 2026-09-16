@@ -94,6 +94,24 @@ class TestFactoryParse(CustomTestCase):
             )
 
 
+class TestFactorySwapInStats(CustomTestCase):
+    def test_default_off(self):
+        cfg = _parse_sparse_config(_FakeArgs(json.dumps({"top_k": 512})))
+        self.assertFalse(cfg.swap_in_stats)
+
+    def test_opt_in(self):
+        cfg = _parse_sparse_config(
+            _FakeArgs(json.dumps({"top_k": 512, "swap_in_stats": True}))
+        )
+        self.assertTrue(cfg.swap_in_stats)
+
+    def test_non_bool_raises(self):
+        with self.assertRaises(ValueError):
+            _parse_sparse_config(
+                _FakeArgs(json.dumps({"top_k": 512, "swap_in_stats": 1}))
+            )
+
+
 class _ResolveShim:
     """Replicates HiSparseCoordinator's per-layer resolve + reserved-write logic.
 
@@ -104,6 +122,8 @@ class _ResolveShim:
     """
 
     def __init__(self, device_buffer_size, top_k, layer_num, device_buffer_sizes):
+        if device_buffer_size > 32768:  # int16 LRU slot indices 0..B-1
+            raise ValueError("exceeds int16 slot range")
         self.device_buffer_size = device_buffer_size
         self.top_k = top_k
         self.layer_num = layer_num
@@ -121,9 +141,9 @@ class _ResolveShim:
             self.device_buffer_sizes = sizes
         self._uniform_buffer = len(set(self.device_buffer_sizes)) == 1
         self._reserved_col_uniform = self.device_buffer_sizes[0]
+        self._reserved_cols = torch.tensor(self.device_buffer_sizes, dtype=torch.int64)
+        self._layer_index = torch.arange(layer_num, dtype=torch.int64)
         padded = device_buffer_size + 4  # + page_size
-        if device_buffer_size > 32768:  # int16 LRU slot indices 0..B-1
-            raise ValueError("exceeds int16 slot range")
         self.req_device_buffer_token_locs = torch.full(
             (layer_num, 8, padded), -1, dtype=torch.int32
         )
@@ -142,8 +162,6 @@ class _ResolveShim:
                 self._reserved_cols[:, None],
             ] = loc_i32[None, :]
 
-        self._reserved_cols = torch.tensor(self.device_buffer_sizes, dtype=torch.int64)
-        self._layer_index = torch.arange(layer_num, dtype=torch.int64)
 
 class TestResolveAndReservedWrite(CustomTestCase):
     def test_none_gives_uniform(self):
@@ -154,6 +172,12 @@ class TestResolveAndReservedWrite(CustomTestCase):
     def test_length_mismatch_raises(self):
         with self.assertRaises(ValueError):
             _ResolveShim(1024, 512, 21, [1024] * 20)
+
+    def test_width_above_int16_raises(self):
+        # LRU slots are int16 on both host bookkeeping and the swap-in kernel.
+        with self.assertRaises(ValueError):
+            _ResolveShim(32768 + 64, 2048, 4, None)
+        _ResolveShim(32768, 2048, 4, None)  # slots 0..32767 fit int16
 
     def test_exceeds_physical_raises(self):
         with self.assertRaises(ValueError):
@@ -173,12 +197,6 @@ class TestResolveAndReservedWrite(CustomTestCase):
         ref[:, req, dbs] = loc
         self.assertTrue(torch.equal(s.req_device_buffer_token_locs, ref))
 
-    def test_width_above_int16_raises(self):
-        # LRU slots are int16 on both host bookkeeping and the swap-in kernel.
-        with self.assertRaises(ValueError):
-            _ResolveShim(32768 + 64, 2048, 4, None)
-        _ResolveShim(32768, 2048, 4, None)  # slots 0..32767 fit int16
-
     def test_per_layer_write_targets_correct_columns(self):
         sizes = [512, 768, 1024]
         s = _ResolveShim(1024, 512, 3, sizes)
@@ -196,9 +214,6 @@ class TestResolveAndReservedWrite(CustomTestCase):
                     torch.all(s.req_device_buffer_token_locs[layer_id, req, 1024] == -1)
                 )
 
-
-if __name__ == "__main__":
-    unittest.main()
     def test_per_layer_vectorized_write_matches_loop(self):
         # The single indexed scatter must write exactly what the original
         # per-layer Python loop wrote, and nothing else.
@@ -218,3 +233,6 @@ if __name__ == "__main__":
             int((s.req_device_buffer_token_locs != -1).sum()), len(sizes) * len(req)
         )
 
+
+if __name__ == "__main__":
+    unittest.main()

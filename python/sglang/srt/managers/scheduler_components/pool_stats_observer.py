@@ -49,6 +49,7 @@ class PoolStats:
     hisparse_device_token_usage: Optional[float] = None
     hisparse_host_tokens: Optional[int] = None
     hisparse_host_token_usage: Optional[float] = None
+    hisparse_swap_hit_rate: Optional[float] = None
 
     def get_kv_token_stats(self) -> Tuple[int, float]:
         # NOTE: mamba pool is not included in the "token usage" calculation.
@@ -111,6 +112,8 @@ class PoolStats:
                 f"#cpu token: {self.hisparse_host_tokens}",
                 f"cpu token usage: {self.hisparse_host_token_usage:.2f}",
             ]
+            if self.hisparse_swap_hit_rate is not None:
+                parts.append(f"swap-in hit rate: {self.hisparse_swap_hit_rate:.3f}")
         if not parts:
             parts.append(
                 f"#token: {self.full_num_used}, token usage: {self.full_token_usage:.2f}"
@@ -235,6 +238,13 @@ class SchedulerPoolStatsObserver:
                 hisparse_device_token_usage=h.device_token_usage,
                 hisparse_host_tokens=h.host_tokens,
                 hisparse_host_token_usage=h.host_token_usage,
+                # Cached inside the coordinator (refreshed at most once a second)
+                # because get_pool_stats runs on the hot path.
+                hisparse_swap_hit_rate=(
+                    self.hisparse_coordinator.get_swap_in_stats().hit_rate
+                    if self.hisparse_coordinator.swap_in_stats_enabled
+                    else None
+                ),
             )
         return pool_stats
 

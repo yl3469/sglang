@@ -65,6 +65,9 @@ class SparseConfig:
     device_buffer_sizes: Optional[List[int]] = None
     host_to_device_ratio: int = 2
     swap_in_block_size: int = 960
+    # Per-layer swap-in hit/miss counters (kernel atomics + a cached device->host
+    # read for logs and /server_info). Off by default; enable for measurement.
+    swap_in_stats: bool = False
     algorithm: Optional[str] = None
     backend: Optional[str] = None
     page_size: Optional[int] = None

@@ -229,6 +229,13 @@ class Server(msgspec.Struct, kw_only=True):
             time.sleep(interval)
         return False
 
+    def save_internal_state(self, out_path: Path) -> None:
+        """Dump /server_info; its ``internal_states`` (one per DP rank) carry
+        ``hisparse_swap_in_stats`` when HiSparse is on."""
+        data = _fetch(f"{self.base_url}/server_info", timeout=60.0)
+        if data:
+            out_path.write_bytes(data)
+
     def save_server_info(self, out_path: Path) -> None:
         data = _fetch(f"{self.base_url}/get_server_info")
         if data:
@@ -315,7 +322,12 @@ def run_bench(
 
 
 def hisparse_config(top_k: int, buffer_sizes_path: str) -> str:
-    return json.dumps({"top_k": top_k, "device_buffer_sizes_path": buffer_sizes_path})
+    cfg = {"top_k": top_k, "device_buffer_sizes_path": buffer_sizes_path}
+    # SWAP_IN_STATS=1 turns on per-layer hit/miss counters (measurement runs only;
+    # same-node A/B showed no measurable cost, but they stay off by default).
+    if env("SWAP_IN_STATS", 0):
+        cfg["swap_in_stats"] = True
+    return json.dumps(cfg)
 
 
 def build_buffer_configs(
@@ -395,6 +407,8 @@ def sweep_arm(
                 extra_args=bench_extra_args,
                 log_file=arm_dir / f"bench_c{c}.log",
             )
+            # Per-layer swap-in counters (cumulative) after this concurrency point.
+            server.save_internal_state(arm_dir / f"swap_stats_c{c}.json")
             if rc != 0:
                 print(f"[{arm}] bench c={c} returned nonzero (see log)", flush=True)
         return True

@@ -1,7 +1,8 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple, Union
+import time
+from typing import List, NamedTuple, Optional, Union
 
 import torch
 
@@ -45,6 +46,27 @@ class HiSparseTokenStats(NamedTuple):
     host_token_usage: float
 
 
+class HiSparseSwapInStats(NamedTuple):
+    """Cumulative swap-in counters since server start (per layer, from the kernel)."""
+
+    misses: List[int]
+    hits: List[int]
+    requests: List[int]
+
+    @property
+    def total_misses(self) -> int:
+        return sum(self.misses)
+
+    @property
+    def total_hits(self) -> int:
+        return sum(self.hits)
+
+    @property
+    def hit_rate(self) -> float:
+        n = self.total_hits + self.total_misses
+        return self.total_hits / n if n else 0.0
+
+
 class HiSparseCoordinator:
     def __init__(
         self,
@@ -60,6 +82,7 @@ class HiSparseCoordinator:
         device_buffer_sizes: Union[List[int], None] = None,
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
+        swap_in_stats: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -74,6 +97,7 @@ class HiSparseCoordinator:
         self._device_buffer_sizes_config = device_buffer_sizes
         self.device = device
         self.swap_in_block_size = swap_in_block_size
+        self.swap_in_stats_enabled = swap_in_stats
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -204,6 +228,15 @@ class HiSparseCoordinator:
             self.device_buffer_sizes, dtype=torch.int64, device=device
         )
         self._layer_index = torch.arange(layer_num, dtype=torch.int64, device=device)
+        # Per-layer [misses, hits, requests] accumulated by the swap-in kernel
+        # (only when enabled; None keeps the kernel's stats pointer null).
+        self.swap_in_stats: Optional[torch.Tensor] = (
+            torch.zeros((layer_num, 3), dtype=torch.int64, device=device)
+            if self.swap_in_stats_enabled
+            else None
+        )
+        self._swap_in_stats_cache: Optional[HiSparseSwapInStats] = None
+        self._swap_in_stats_cache_time = 0.0
         logger.info(
             "HiSparse per-layer device buffer sizes: min=%d max=%d mean=%d "
             "(physical width=%d, uniform=%s)",
@@ -279,6 +312,25 @@ class HiSparseCoordinator:
                 host_tokens / host_capacity if host_capacity > 0 else 0.0
             ),
         )
+
+    def get_swap_in_stats(self, max_age_s: float = 1.0) -> HiSparseSwapInStats:
+        """Read back the per-layer swap-in counters (one device sync, cached)."""
+        if self.swap_in_stats is None:
+            zeros = [0] * self.layer_num
+            return HiSparseSwapInStats(misses=zeros, hits=zeros, requests=zeros)
+        now = time.monotonic()
+        if (
+            self._swap_in_stats_cache is None
+            or now - self._swap_in_stats_cache_time > max_age_s
+        ):
+            rows = self.swap_in_stats.cpu().tolist()
+            self._swap_in_stats_cache = HiSparseSwapInStats(
+                misses=[r[0] for r in rows],
+                hits=[r[1] for r in rows],
+                requests=[r[2] for r in rows],
+            )
+            self._swap_in_stats_cache_time = now
+        return self._swap_in_stats_cache
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
@@ -923,5 +975,8 @@ class HiSparseCoordinator:
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
+            layer_stats=(
+                None if self.swap_in_stats is None else self.swap_in_stats[layer_id]
+            ),
         )
         return top_k_indices

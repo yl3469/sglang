@@ -4122,6 +4122,18 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        if (
+            self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.swap_in_stats_enabled
+        ):
+            sw = self.hisparse_coordinator.get_swap_in_stats(max_age_s=0.0)
+            ret["hisparse_swap_in_stats"] = {
+                "misses_per_layer": sw.misses,
+                "hits_per_layer": sw.hits,
+                "requests_per_layer": sw.requests,
+                "hit_rate": sw.hit_rate,
+                "device_buffer_sizes": self.hisparse_coordinator.device_buffer_sizes,
+            }
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
