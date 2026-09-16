@@ -2,7 +2,7 @@
 
 import logging
 import time
-from typing import List, NamedTuple, Optional, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Union
 
 import torch
 
@@ -45,6 +45,10 @@ class HiSparseTokenStats(NamedTuple):
     device_token_usage: float
     host_tokens: int
     host_token_usage: float
+    # Physically per-layer device buffers (0 when buffers share pool rows).
+    buffer_slots: int
+    buffer_rows_per_slot: int
+    buffer_bytes: int
 
 
 class HiSparseSwapInStats(NamedTuple):
@@ -328,6 +332,7 @@ class HiSparseCoordinator:
         device_tokens = device_capacity - device_allocator.available_size()
         host_capacity = self.mem_pool_host.size
         host_tokens = host_capacity - self.mem_pool_host.available_size()
+        layout = self.buffer_layout_summary()
         return HiSparseTokenStats(
             device_tokens=device_tokens,
             device_token_usage=(
@@ -337,7 +342,46 @@ class HiSparseCoordinator:
             host_token_usage=(
                 host_tokens / host_capacity if host_capacity > 0 else 0.0
             ),
+            buffer_slots=layout["num_slots"] if layout else 0,
+            buffer_rows_per_slot=layout["rows_per_slot"] if layout else 0,
+            buffer_bytes=layout["buffer_bytes"] if layout else 0,
         )
+
+    def buffer_layout_summary(self) -> Optional[Dict[str, Any]]:
+        """Geometry and bytes of the per-layer private buffer regions, or None
+        when buffers share pool rows (DeepSeek-V4 path or no layout)."""
+        if self.layer_buffers is None:
+            return None
+        layout = self.layer_buffers.layout
+        kv = self.mem_pool_device.kv_buffer[0]
+        row_bytes = kv[0].numel() * kv.element_size()
+        return {
+            "buffer_sizes": list(layout.buffer_sizes),
+            "shared_width": layout.shared_width,
+            "num_slots": layout.num_slots,
+            "rows_per_slot": sum(layout.buffer_sizes),
+            "row_bytes": row_bytes,
+            "buffer_bytes": layout.buffer_bytes(row_bytes),
+        }
+
+    def get_swap_in_stats(self, max_age_s: float = 1.0) -> HiSparseSwapInStats:
+        """Read back the per-layer swap-in counters (one device sync, cached)."""
+        if self.swap_in_stats is None:
+            zeros = [0] * self.layer_num
+            return HiSparseSwapInStats(misses=zeros, hits=zeros, requests=zeros)
+        now = time.monotonic()
+        if (
+            self._swap_in_stats_cache is None
+            or now - self._swap_in_stats_cache_time > max_age_s
+        ):
+            rows = self.swap_in_stats.cpu().tolist()
+            self._swap_in_stats_cache = HiSparseSwapInStats(
+                misses=[r[0] for r in rows],
+                hits=[r[1] for r in rows],
+                requests=[r[2] for r in rows],
+            )
+            self._swap_in_stats_cache_time = now
+        return self._swap_in_stats_cache
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True

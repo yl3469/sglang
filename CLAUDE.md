@@ -54,7 +54,12 @@ python -m sglang.benchmark.serving --backend sglang --base-url http://127.0.0.1:
 ```
 
 HiSparse is enabled with `--enable-hisparse --hisparse-config '{"top_k": 512, "device_buffer_sizes_path": "<json>"}'`
-and hard-requires `--disable-radix-cache` (`python/sglang/srt/arg_groups/hisparse_hook.py`).
+and hard-requires `--disable-radix-cache` (`python/sglang/srt/arg_groups/hisparse_hook.py`). On the DSA path
+(GLM-5.x, DeepSeek-V3.2) the per-layer device buffers are *physically* per layer: layer `l`'s KV tensor is
+`max_total_num_tokens + page_size + K * B_l` rows (`K` = request slots = `max_running_requests // attn_dp_size + 1`),
+so `--max-running-requests` is mandatory and the buffer bytes `K * sum_l B_l * row_bytes` are taken off the KV
+budget (additional when `--max-total-tokens` is pinned). Geometry is `mem_cache/hisparse_buffer_layout.py`;
+the resident/LRU split per (request, layer) is `managers/hisparse_layer_buffers.py`. DeepSeek-V4 keeps shared rows.
 
 ### Cluster notes (NVIDIA Slurm cluster, aarch64 GB300)
 
@@ -127,6 +132,11 @@ measured cost either way). Read them from `/server_info` -> `internal_states[i].
 (m) The DP works only when fit budget == served budget: `make_buffer_sizes --total-ratio auto` (needs the
 `dp_meta.json` sidecar run_per_layer_dp now writes) picks the row for the served B_MEAN or falls back to uniform.
 Measured GLM-FP8 AA-LCR @10240 slots: uniform 6.3% misses vs dp 5.6% (-12%), worst layer 0.158 -> 0.096.
+(n) 2026-09-15 physically per-layer buffers (DSA path): a layer uses the request's shared rows while
+`seq_len <= B_l` (kernel fast path needs slot t == token t) and moves to its private region rows with a warm D2D
+copy of tokens `[0, B_l)` once `seq_len > B_l`; the shared rows go back to the pool at `seq_len >= shared_width+2`.
+uniform and dp with equal slot totals are now byte-identical: compare `/server_info` ->
+`internal_states[i].hisparse_buffer_layout.buffer_bytes` and `memory_usage.kvcache` (`.slurm_logs/byte_equality_check.py`).
 
 ## Architecture
 

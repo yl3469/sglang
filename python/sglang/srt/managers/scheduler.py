@@ -4122,6 +4122,10 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        if self.hisparse_coordinator is not None:
+            ret["hisparse_buffer_layout"] = (
+                self.hisparse_coordinator.buffer_layout_summary()
+            )
         if (
             self.hisparse_coordinator is not None
             and self.hisparse_coordinator.swap_in_stats_enabled
