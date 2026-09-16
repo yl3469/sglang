@@ -49,6 +49,13 @@ def main() -> None:
         help="dp_allocations.csv row (ratio) or 'auto' = match the served B_MEAN",
     )
     p.add_argument("--b-mean", type=int, default=ec.env("B_MEAN", 1024))
+    p.add_argument(
+        "--buffer-configs-dir",
+        default=ec.env("BUFFER_CONFIGS_DIR", ""),
+        help="Use existing buffer_sizes_{uniform,dp}.json from this directory "
+        "(e.g. make_buffer_sizes --target-csv output for an iso-miss-rate A/B) "
+        "instead of building matched-total configs from --dp-csv.",
+    )
     p.add_argument("--page-size", type=int, default=ec.env("PAGE_SIZE_SLOTS", 64))
     p.add_argument(
         "--out-dir",
@@ -58,17 +65,25 @@ def main() -> None:
 
     ec.setup_environment(args.hf_cache)
     ec.require_file(args.swe_jsonl, "dataset")
-    ec.require_file(args.dp_csv, "dp csv")
-
     out_dir = Path(args.out_dir)
-    cfgs = ec.build_buffer_configs(
-        args.dp_csv,
-        out_dir / "buffer_configs",
-        args.dp_total_row,
-        args.b_mean,
-        args.top_k,
-        args.page_size,
-    )
+    if args.buffer_configs_dir:
+        cfg_dir = Path(args.buffer_configs_dir)
+        cfgs = {
+            "uniform": cfg_dir / "buffer_sizes_uniform.json",
+            "dp": cfg_dir / "buffer_sizes_dp.json",
+        }
+        for name, path in cfgs.items():
+            ec.require_file(str(path), f"{name} buffer sizes")
+    else:
+        ec.require_file(args.dp_csv, "dp csv")
+        cfgs = ec.build_buffer_configs(
+            args.dp_csv,
+            out_dir / "buffer_configs",
+            args.dp_total_row,
+            args.b_mean,
+            args.top_k,
+            args.page_size,
+        )
     conc = ec.parse_concurrency(args.concurrency_list)
     hs_uniform = [
         "--enable-hisparse",

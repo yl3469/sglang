@@ -35,6 +35,7 @@ from typing import Dict, List, Optional, Sequence
 from sglang.srt.mem_cache.sparsity.per_layer_budget_dp import (
     LayerCostCurve,
     dp_allocate,
+    dp_allocate_for_target,
 )
 from sglang.srt.mem_cache.sparsity.trace.trace_to_curves import (
     DEFAULT_MEASURE_RATIOS,
@@ -51,6 +52,9 @@ __all__ = [
     "kv_budget_to_ratio",
     "build_dp_rows",
     "write_dp_allocations_csv",
+    "uniform_grid_for_target",
+    "build_target_rows",
+    "write_target_csv",
 ]
 
 
@@ -190,6 +194,79 @@ def write_dp_allocations_csv(
             writer.writerow(row)
 
 
+def uniform_grid_for_target(
+    curves: Sequence[LayerCostCurve], target_miss_rate: float
+) -> Optional[int]:
+    """Smallest uniform per-layer grid size whose mean miss rate meets the target
+    (None when even the largest commonly measured size cannot)."""
+    lo = max(c.min_size for c in curves)
+    hi = min(c.max_size for c in curves)
+    for g in range(lo, hi + 1):
+        if uniform_miss_rate(curves, g) <= target_miss_rate:
+            return g
+    return None
+
+
+def build_target_rows(
+    curves: Sequence[LayerCostCurve],
+    target_miss_rates: Sequence[float],
+    layer_ids: Sequence[int],
+) -> List[Dict[str, object]]:
+    """Rows of ``dp_target_allocations.csv``: for each target mean miss rate the
+    smallest layer-sum DP allocation that meets it, next to the smallest
+    UNIFORM budget that meets it. ``rows_saving`` is the fraction of buffer rows
+    (= bytes, with per-layer physical buffers) the DP saves over uniform at the
+    same miss rate. Unreachable targets are skipped with a message.
+    """
+    if len(layer_ids) != len(curves):
+        raise ValueError(
+            f"layer_ids ({len(layer_ids)}) must match curve count ({len(curves)})"
+        )
+    num_layers = len(curves)
+    rows: List[Dict[str, object]] = []
+    for target in target_miss_rates:
+        try:
+            alloc = dp_allocate_for_target(curves, target, grid_step=1)
+        except ValueError as exc:
+            print(f"  target {target:g}: skipped ({exc})")
+            continue
+        ug = uniform_grid_for_target(curves, target)
+        dp_total = alloc.total_budget
+        row: Dict[str, object] = {
+            "target_miss_rate": target,
+            "dp_mean_ratio": dp_total / num_layers * RATIO_STEP,
+            "uniform_mean_ratio": (ug * RATIO_STEP) if ug is not None else "",
+            "rows_saving": (1.0 - dp_total / (ug * num_layers)) if ug else "",
+            "predicted_dp_miss_rate": alloc.total_cost / num_layers,
+            "predicted_uniform_miss_rate": (
+                uniform_miss_rate(curves, ug) if ug is not None else ""
+            ),
+        }
+        for lid, grid in zip(layer_ids, alloc.per_layer_grid):
+            row[f"layer_{lid}"] = grid * RATIO_STEP
+        rows.append(row)
+    return rows
+
+
+def write_target_csv(
+    path: str, rows: Sequence[Dict[str, object]], layer_ids: Sequence[int]
+) -> None:
+    fieldnames = [
+        "target_miss_rate",
+        "dp_mean_ratio",
+        "uniform_mean_ratio",
+        "rows_saving",
+        "predicted_dp_miss_rate",
+        "predicted_uniform_miss_rate",
+    ] + [f"layer_{lid}" for lid in layer_ids]
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def _resolve_layer_ids(
     arg_ids: Optional[Sequence[int]],
     num_layers: int,
@@ -226,6 +303,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         type=float,
         default=[0.1, 0.15, 0.2, 0.3],
         help="Uniform-equivalent mean budgets; total = num_layers * ratio.",
+    )
+    parser.add_argument(
+        "--target-miss-rates",
+        nargs="*",
+        type=float,
+        default=[],
+        help="Also solve the dual: fewest buffer rows (bytes) whose DP split "
+        "meets each target mean miss rate -> dp_target_allocations.csv.",
     )
     parser.add_argument("--min-buffer-slots", type=int, default=513)
     parser.add_argument(
@@ -314,6 +399,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     csv_path = os.path.join(args.out_dir, "dp_allocations.csv")
     write_dp_allocations_csv(csv_path, rows, layer_ids)
     print(f"Wrote {csv_path}")
+    if args.target_miss_rates:
+        target_rows = build_target_rows(curves, args.target_miss_rates, layer_ids)
+        target_path = os.path.join(args.out_dir, "dp_target_allocations.csv")
+        write_target_csv(target_path, target_rows, layer_ids)
+        print(f"Wrote {target_path}")
+        for row in target_rows:
+            saving = row["rows_saving"]
+            print(
+                f"  target {row['target_miss_rate']:g}: dp mean ratio "
+                f"{row['dp_mean_ratio']:.4f} vs uniform {row['uniform_mean_ratio']} "
+                f"-> rows saved {saving if saving == '' else f'{saving * 100:.1f}%'}"
+            )
     # Sidecar so make_buffer_sizes --total-ratio auto can map a served buffer
     # size (slots) onto the ratio grid: ratio = b_mean / mean_slot_ctx0.
     meta_path = os.path.join(args.out_dir, "dp_meta.json")
@@ -325,6 +422,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "num_requests": len(requests),
                 "measure_ratios": list(args.measure_ratios),
                 "total_ratios": [row["total_ratio"] for row in rows],
+                "target_miss_rates": list(args.target_miss_rates),
             },
             f,
             indent=2,

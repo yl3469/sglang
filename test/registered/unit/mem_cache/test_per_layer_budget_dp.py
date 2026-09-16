@@ -199,6 +199,60 @@ class TestDpAllocateForTarget(CustomTestCase):
         self.assertLess(alloc.total_budget, uniform * len(curves))
 
 
+class TestTargetRowsAndSizes(CustomTestCase):
+    def _curves(self):
+        sizes = [1, 2, 3, 4, 5, 6, 7]
+        costs = [
+            [0.30, 0.18, 0.12, 0.09, 0.07, 0.06, 0.05],
+            [0.50, 0.20, 0.08, 0.05, 0.04, 0.03, 0.02],
+            [0.10, 0.09, 0.08, 0.07, 0.06, 0.05, 0.04],
+        ]
+        return [LayerCostCurve(sizes=sizes, costs=c) for c in costs]
+
+    def test_target_rows_save_rows_at_equal_miss_rate(self):
+        from sglang.srt.mem_cache.sparsity.trace.run_per_layer_dp import (
+            build_target_rows,
+            uniform_grid_for_target,
+        )
+        from sglang.srt.mem_cache.sparsity.trace.trace_to_curves import RATIO_STEP
+
+        curves = self._curves()
+        rows = build_target_rows(curves, [0.08, 0.01], layer_ids=[0, 1, 2])
+        self.assertEqual(len(rows), 1)  # 0.01 is unreachable -> skipped
+        row = rows[0]
+        self.assertLessEqual(row["predicted_dp_miss_rate"], 0.08)
+        ug = uniform_grid_for_target(curves, 0.08)
+        self.assertAlmostEqual(row["uniform_mean_ratio"], ug * RATIO_STEP)
+        self.assertGreater(row["rows_saving"], 0.0)
+        dp_total = sum(row[f"layer_{l}"] for l in range(3)) / RATIO_STEP
+        self.assertAlmostEqual(dp_total / 3 * RATIO_STEP, row["dp_mean_ratio"])
+
+    def test_target_csv_roundtrip_and_sizes(self):
+        from sglang.srt.mem_cache.sparsity.trace.make_buffer_sizes import (
+            build_target_buffer_sizes,
+            read_target_row,
+        )
+        from sglang.srt.mem_cache.sparsity.trace.run_per_layer_dp import (
+            build_target_rows,
+            write_target_csv,
+        )
+
+        curves = self._curves()
+        rows = build_target_rows(curves, [0.08], layer_ids=[0, 1, 2])
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "dp_target_allocations.csv")
+            write_target_csv(path, rows, [0, 1, 2])
+            layer_ratio, uniform_ratio, chosen = read_target_row(path, 0.08)
+        self.assertEqual(chosen, 0.08)
+        self.assertEqual(sorted(layer_ratio), [0, 1, 2])
+        uniform, dp, ids = build_target_buffer_sizes(
+            layer_ratio, uniform_ratio, mean_slot_ctx0=100000, top_k=64, page_size=64
+        )
+        self.assertEqual(ids, [0, 1, 2])
+        self.assertTrue(all(b % 64 == 0 and b >= 64 for b in uniform + dp))
+        self.assertLess(sum(dp), sum(uniform))
+
+
 class TestReplay(CustomTestCase):
     def test_belady_never_worse_than_lru(self):
         trace = make_synthetic_trace(num_steps=80, top_k=8, vocab=40, seed=3)
