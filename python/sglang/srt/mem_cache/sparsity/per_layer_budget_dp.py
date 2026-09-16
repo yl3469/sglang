@@ -34,9 +34,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
-__all__ = ["LayerCostCurve", "DPAllocation", "dp_allocate", "dp_allocate_for_target"]
-
-_INF = float("inf")
+__all__ = ["LayerCostCurve", "DPAllocation", "dp_allocate"]
 
 
 @dataclass(frozen=True)
@@ -171,7 +169,18 @@ def dp_allocate(
             "degenerates to the uniform split"
         )
 
-    floor_grid = _resolve_floor_grid(cost_curves, floors, grid_step)
+    if floors is None:
+        floor_grid = [curve.min_size for curve in cost_curves]
+    else:
+        if len(floors) != num_layers:
+            raise ValueError("floors must have one entry per layer")
+        floor_grid = []
+        for f, curve in zip(floors, cost_curves):
+            # Round the floor UP to a grid multiple so B_l stays grid-aligned
+            # while never dropping below the requested floor.
+            fg = math.ceil(f / grid_step)
+            fg = max(fg, curve.min_size)
+            floor_grid.append(fg)
 
     floor_total = sum(floor_grid)
     if floor_total > total_grid:
@@ -184,100 +193,49 @@ def dp_allocate(
     # Per-layer max usable grid size, capped by both the curve and the total
     # budget (a single layer can never need more than the whole budget).
     cap_grid = [min(curve.max_size, total_grid) for curve in cost_curves]
-    dp, choice = _min_plus_sweep(cost_curves, total_grid, floor_grid, cap_grid)
 
-    # The optimum uses the full budget when more capacity never hurts (costs are
-    # non-increasing in size for real miss curves), but we take the min over the
-    # feasible tail [floor_total, total_grid] to stay correct for arbitrary curves.
-    best_b = None
-    best_cost = _INF
-    for b in range(floor_total, total_grid + 1):
-        if dp[b] < best_cost:
-            best_cost = dp[b]
-            best_b = b
-    if best_b is None or best_cost == _INF:
-        raise ValueError(
-            "DP found no feasible allocation; check floors, caps, and curves"
-        )
-    per_layer_grid = _backtrack(choice, best_b)
-
-    per_layer_budget = [g * grid_step for g in per_layer_grid]
-    return DPAllocation(
-        per_layer_budget=per_layer_budget,
-        per_layer_grid=per_layer_grid,
-        total_cost=best_cost,
-        grid_step=grid_step,
-        mean_budget=mean_budget,
-    )
-
-
-def _resolve_floor_grid(
-    cost_curves: Sequence[LayerCostCurve],
-    floors: Optional[Sequence[int]],
-    grid_step: int,
-) -> List[int]:
-    """Per-layer floor in grid units (curve minimum when no floors are given)."""
-    if floors is None:
-        return [curve.min_size for curve in cost_curves]
-    if len(floors) != len(cost_curves):
-        raise ValueError("floors must have one entry per layer")
-    floor_grid = []
-    for f, curve in zip(floors, cost_curves):
-        # Round the floor UP to a grid multiple so B_l stays grid-aligned
-        # while never dropping below the requested floor.
-        fg = math.ceil(f / grid_step)
-        fg = max(fg, curve.min_size)
-        floor_grid.append(fg)
-    return floor_grid
-
-
-def _min_plus_sweep(
-    cost_curves: Sequence[LayerCostCurve],
-    total_grid: int,
-    floor_grid: Sequence[int],
-    cap_grid: Sequence[int],
-):
-    """Min-plus convolution over layers.
-
-    Returns ``(dp, choice)``: ``dp[b]`` is the least summed cost using EXACTLY
-    ``b`` grid units over all layers (inf when infeasible) and
-    ``choice[l][b]`` the grid size given to layer ``l`` on the path to ``dp[b]``
-    after processing layers ``0..l``.
-    """
-    num_layers = len(cost_curves)
-    dp = [_INF] * (total_grid + 1)
+    # DP over layers. f[b] = min summed cost using layers processed so far with
+    # exactly b grid units allocated. We track "exactly b" (not "<= b") and read
+    # the optimum over the feasible tail at the end, which keeps the recurrence a
+    # clean min-plus convolution.
+    NEG = float("inf")
+    # After processing layer 0..l, dp[b] holds the best cost; choice[l][b] holds
+    # the grid size given to layer l to reach that optimum (for backtracking).
+    dp = [NEG] * (total_grid + 1)
     choice: List[List[int]] = [[0] * (total_grid + 1) for _ in range(num_layers)]
 
+    # Base: layer 0.
     curve0 = cost_curves[0]
     lo0, hi0 = floor_grid[0], cap_grid[0]
     if lo0 > hi0:
         raise ValueError(
-            f"layer 0 floor ({lo0}) exceeds its max curve size ({hi0}) in grid units"
+            f"layer 0 floor ({lo0 * grid_step}) exceeds its max curve size "
+            f"({hi0 * grid_step})"
         )
-    for x in _candidate_sizes(curve0, lo0, hi0):
+    for x in range(lo0, hi0 + 1):
         dp[x] = curve0.cost_at(x)
         choice[0][x] = x
 
+    # Layers 1..L-1.
     for l in range(1, num_layers):
         curve = cost_curves[l]
         lo, hi = floor_grid[l], cap_grid[l]
         if lo > hi:
             raise ValueError(
-                f"layer {l} floor ({lo}) exceeds its max curve size ({hi}) in grid units"
+                f"layer {l} floor ({lo * grid_step}) exceeds its max curve size "
+                f"({hi * grid_step})"
             )
         prev = dp
-        cur = [_INF] * (total_grid + 1)
-        candidates = _candidate_sizes(curve, lo, hi)
+        cur = [NEG] * (total_grid + 1)
         for b in range(total_grid + 1):
-            best = _INF
+            best = NEG
             best_x = lo
             # Give layer l a size x in [lo, hi]; the rest (b - x) goes to prior
             # layers, which needed at least their cumulative floors.
-            for x in candidates:
-                if x > b:
-                    break
+            x_max = min(hi, b)
+            for x in range(lo, x_max + 1):
                 prev_cost = prev[b - x]
-                if prev_cost == _INF:
+                if prev_cost == NEG:
                     continue
                 total = prev_cost + curve.cost_at(x)
                 if total < best:
@@ -286,79 +244,34 @@ def _min_plus_sweep(
             cur[b] = best
             choice[l][b] = best_x
         dp = cur
-    return dp, choice
 
+    # The optimum uses the full budget when more capacity never hurts (costs are
+    # non-increasing in size for real miss curves), but we take the min over the
+    # feasible tail [floor_total, total_grid] to stay correct for arbitrary curves.
+    best_b = None
+    best_cost = NEG
+    for b in range(floor_total, total_grid + 1):
+        if dp[b] < best_cost:
+            best_cost = dp[b]
+            best_b = b
+    if best_b is None or best_cost == NEG:
+        raise ValueError(
+            "DP found no feasible allocation; check floors, caps, and curves"
+        )
 
-def _candidate_sizes(curve: LayerCostCurve, lo: int, hi: int) -> List[int]:
-    """Grid sizes worth granting to one layer: its measured points in [lo, hi]
-    plus the floor itself. Costs are step functions, so a size strictly between
-    two measured points costs the same as the lower one while using more
-    budget; it can never be part of a minimal-budget or minimal-cost optimum.
-    Restricting the inner loop to these keeps the sweep exact and turns
-    O(L * B * B) into O(L * B * points)."""
-    sizes = [lo] + [x for x in curve.sizes if lo < x <= hi]
-    return sizes
-
-
-def _backtrack(choice: Sequence[Sequence[int]], b: int) -> List[int]:
-    num_layers = len(choice)
+    # Backtrack the per-layer grid sizes.
     per_layer_grid = [0] * num_layers
+    b = best_b
     for l in range(num_layers - 1, -1, -1):
         x = choice[l][b]
         per_layer_grid[l] = x
         b -= x
-    return per_layer_grid
 
-
-def dp_allocate_for_target(
-    cost_curves: Sequence[LayerCostCurve],
-    target_mean_cost: float,
-    grid_step: int,
-    floors: Optional[Sequence[int]] = None,
-) -> DPAllocation:
-    """Smallest layer-sum budget whose optimal split meets a target mean cost.
-
-    The dual of :func:`dp_allocate`: instead of "best misses for a fixed
-    budget" this answers "fewest buffer rows (bytes) for at most
-    ``target_mean_cost`` mean miss cost". With physically per-layer buffers
-    every row costs the same bytes in every layer, so minimizing the grid sum
-    minimizes device memory. One min-plus sweep over the full grid gives
-    ``dp[b]`` for every total ``b``; the answer is the smallest feasible ``b``
-    with ``dp[b] <= target_mean_cost * num_layers``.
-
-    Raises ValueError when even the largest measured sizes cannot reach the
-    target (the target lies below the traces' compulsory-miss floor).
-    """
-    if grid_step <= 0:
-        raise ValueError("grid_step must be positive")
-    if target_mean_cost < 0:
-        raise ValueError("target_mean_cost must be non-negative")
-    num_layers = len(cost_curves)
-    if num_layers == 0:
-        raise ValueError("cost_curves must be non-empty")
-
-    floor_grid = _resolve_floor_grid(cost_curves, floors, grid_step)
-    cap_grid = [curve.max_size for curve in cost_curves]
-    total_grid = sum(cap_grid)
-    dp, choice = _min_plus_sweep(cost_curves, total_grid, floor_grid, cap_grid)
-
-    target_total = target_mean_cost * num_layers
-    best_b = None
-    for b in range(sum(floor_grid), total_grid + 1):
-        if dp[b] <= target_total:
-            best_b = b
-            break
-    if best_b is None:
-        floor_cost = min(c for c in dp if c != _INF) / num_layers
-        raise ValueError(
-            f"target mean cost {target_mean_cost} is unreachable; the measured "
-            f"curves bottom out at {floor_cost:.4f} even at their largest sizes"
-        )
-    per_layer_grid = _backtrack(choice, best_b)
+    per_layer_budget = [g * grid_step for g in per_layer_grid]
     return DPAllocation(
-        per_layer_budget=[g * grid_step for g in per_layer_grid],
+        per_layer_budget=per_layer_budget,
         per_layer_grid=per_layer_grid,
-        total_cost=dp[best_b],
+        total_cost=best_cost,
         grid_step=grid_step,
-        mean_budget=math.ceil(best_b / num_layers) * grid_step,
+        mean_budget=mean_budget,
     )

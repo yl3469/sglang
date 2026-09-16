@@ -5,7 +5,6 @@ import unittest
 from sglang.srt.mem_cache.sparsity.per_layer_budget_dp import (
     LayerCostCurve,
     dp_allocate,
-    dp_allocate_for_target,
 )
 from sglang.srt.mem_cache.sparsity.per_layer_budget_replay import (
     build_cost_curves,
@@ -128,75 +127,6 @@ class TestDPAllocate(CustomTestCase):
             cost = sum(curve.cost_at(x) for curve, x in zip(curves, combo))
             best = min(best, cost)
         self.assertAlmostEqual(alloc.total_cost, best)
-
-
-class TestDpAllocateForTarget(CustomTestCase):
-    SIZES = [1, 2, 3, 4, 5, 6, 7]
-    COSTS = [
-        [30, 18, 12, 9, 7, 6, 5],
-        [50, 20, 8, 5, 4, 3, 2],
-        [10, 9, 8, 7, 6, 5, 4],
-    ]
-
-    def _curves(self):
-        return [LayerCostCurve(sizes=self.SIZES, costs=c) for c in self.COSTS]
-
-    def test_minimal_total_against_brute_force(self):
-        import itertools
-
-        curves = self._curves()
-        target = 8.0  # mean cost -> summed cost <= 24
-        alloc = dp_allocate_for_target(curves, target, grid_step=1)
-        self.assertLessEqual(alloc.total_cost, target * len(curves))
-        best_total = None
-        for combo in itertools.product(range(1, 8), repeat=len(curves)):
-            cost = sum(c.cost_at(x) for c, x in zip(curves, combo))
-            if cost <= target * len(curves):
-                if best_total is None or sum(combo) < best_total:
-                    best_total = sum(combo)
-        self.assertEqual(alloc.total_budget, best_total)
-
-    def test_target_is_dual_of_fixed_budget(self):
-        # Re-solving the fixed-budget DP at the returned layer-sum can do no
-        # better than the target, and one grid unit less must violate it.
-        curves = self._curves()
-        target = 6.0
-        alloc = dp_allocate_for_target(curves, target, grid_step=1)
-        total = alloc.total_budget
-        self.assertLessEqual(alloc.total_cost, target * len(curves))
-        if total % len(curves) == 0:
-            fixed = dp_allocate(curves, total // len(curves), grid_step=1)
-            self.assertAlmostEqual(fixed.total_cost, alloc.total_cost)
-        import itertools
-
-        for combo in itertools.product(range(1, 8), repeat=len(curves)):
-            if sum(combo) < total:
-                cost = sum(c.cost_at(x) for c, x in zip(curves, combo))
-                self.assertGreater(cost, target * len(curves))
-
-    def test_floors_and_grid_step_scale_budgets(self):
-        curves = self._curves()
-        alloc = dp_allocate_for_target(
-            curves, 8.0, grid_step=64, floors=[3 * 64, 64, 64]
-        )
-        self.assertGreaterEqual(alloc.per_layer_budget[0], 3 * 64)
-        self.assertTrue(all(b % 64 == 0 for b in alloc.per_layer_budget))
-        self.assertEqual(alloc.mean_budget % 64, 0)
-
-    def test_unreachable_target_raises(self):
-        with self.assertRaises(ValueError):
-            dp_allocate_for_target(self._curves(), 1.0, grid_step=1)
-
-    def test_uses_fewer_rows_than_uniform_for_skewed_layers(self):
-        curves = self._curves()
-        target = 8.0
-        alloc = dp_allocate_for_target(curves, target, grid_step=1)
-        uniform = next(
-            g
-            for g in range(1, 8)
-            if sum(c.cost_at(g) for c in curves) / len(curves) <= target
-        )
-        self.assertLess(alloc.total_budget, uniform * len(curves))
 
 
 class TestReplay(CustomTestCase):
