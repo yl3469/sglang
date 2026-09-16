@@ -48,7 +48,7 @@ Every CI test file registers itself at module level with literal args, e.g.
 Serve and benchmark:
 
 ```bash
-python -m sglang.launch_server --model-path <path> --tp-size 8 --trust-remote-code --port 30000
+python -m sglang.launch_server --model-path <path> --tp-size 4 --trust-remote-code --port 30000
 python -m sglang.benchmark.serving --backend sglang --base-url http://127.0.0.1:30000 \
     --dataset-name custom --dataset-path <jsonl> --num-prompts 200 --max-concurrency 8
 ```
@@ -56,17 +56,77 @@ python -m sglang.benchmark.serving --backend sglang --base-url http://127.0.0.1:
 HiSparse is enabled with `--enable-hisparse --hisparse-config '{"top_k": 512, "device_buffer_sizes_path": "<json>"}'`
 and hard-requires `--disable-radix-cache` (`python/sglang/srt/arg_groups/hisparse_hook.py`).
 
-### Cluster notes (NVIDIA cw-dfw Slurm cluster)
+### Cluster notes (NVIDIA Slurm cluster, aarch64 GB300)
 
-- The login/VS Code node has **no GPU and no CUDA toolkit**; all serving/benchmark work runs under Slurm.
-  Nodes are 8x H100 80GB (`batch` 4h, `batch_short` 2h, `batch_long` 8h, `interactive` 4h),
-  account `coreai_horizon_dilations`. Blackwell-only features (NVFP4 GEMMs) do not run here.
-- `sbatch -A coreai_horizon_dilations -p batch --nodes=1 --gpus-per-node=8 --time=04:00:00 --wrap=...`
-  works directly; the `slurm-broker` MCP tools are an alternative.
-- `$HOME` is a 10 GB NFS share; the repo, venvs, HF caches and results live on Lustre
-  (`/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/yueyingl/`, 50 TB quota).
-  Lustre metadata is slow: `git` and `find` over the tree can take minutes; prefer targeted paths, and
-  always use absolute paths in shell commands (the shell cwd can drift).
+- The login/VS Code node has **no GPU**; all serving/benchmark work runs under Slurm. Login and compute
+  nodes are both **aarch64**, so a venv built on the login node runs on compute nodes. Compute nodes
+  (`nvl72d*`) have **4x GB300** (Blackwell, ~280 GB each), 144 cores, ~920 GB RAM. Partitions: `batch`
+  4h, `batch_long` 7d. Account `coreai_horizon_dilations`. The QOS rejects `--gpus-per-node` < 4
+  (`QOSMinGRES`); always request the whole node.
+- `sbatch -A coreai_horizon_dilations -p batch_long --nodes=1 --gpus-per-node=4 --time=08:00:00 <script>`
+  works directly; the `slurm-broker` MCP tools are an alternative. Compute nodes have fast internet
+  (a 167 GB HF checkpoint downloads in ~1 min), so `hf download` belongs inside the job.
+- `$HOME` is a small NFS share; the repo, venvs, HF cache and results live on
+  `/scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/yueyingl/` (`hf_cache/` is the
+  `HF_HOME`; set `UV_CACHE_DIR` there too). Use absolute paths in shell commands (the shell cwd can drift).
+- No Rust toolchain on the cluster: build the editable install with `SGLANG_BUILD_RUST_EXTS=none`
+  (skips the gRPC/multimodal/Rust-server extensions, which the HTTP serving path does not need).
+- Running any `trace/*.py` module directly (outside `collect_trace`/`ab_sweep`) needs `CUDA_HOME`
+  pointed at the bundled toolkit, or `deep_gemm` asserts on import. `.slurm_logs/common_env.sh`
+  (untracked) exports the same env `exp_common.setup_environment` applies.
+
+### Running the HiSparse A/B study (dense vs uniform vs DP)
+
+Three arms, all on one 4-GPU node with `TP=4 DP=4` (DP-attention), served from
+`DeepSeek-V4-Flash-0731` over the shared `results/_shared/swe_bench_300.jsonl` prompt set
+(`prep_swe_bench.py --num-prompts 300 --min-tokens 20000 --max-tokens 120000`):
+
+| arm | HiSparse | per-layer buffers | runner |
+|---|---|---|---|
+| `dense` | off (full compressed KV on GPU) | n/a | `dense_baseline.py` (`OUT_DIR=results/dense_<job>`) |
+| `uniform` | on | flat, same total memory as `dp` | `ab_sweep.py` (`OUT_DIR=results/ab_<job>`) |
+| `dp` | on | `run_per_layer_dp.py` allocation | same `ab_sweep.py` invocation |
+
+Order: (1) `collect_trace.py` (`RESULTS_DIR=results/<job>`; ~9 min/prompt at 16 prompts, since
+returning indexer top-k dominates) writes `results/<job>/per_layer_budget_dp/dp_allocations.csv`;
+(2) `DP_CSV=<that csv> ab_sweep.py` runs `uniform` then `dp`; (3) `dense_baseline.py` is independent
+and can run on another node in parallel; (4) `make_report.py --results-root results --out report.html`
+merges every `ab_*`/`dense_*` folder. Model load takes ~7-15 min per server. Ready-made job scripts
+live in `.slurm_logs/{hisparse_ab_pipeline,dense_job,ab_job}.sh` (untracked).
+
+Gotchas seen on 2026-09-11 (jobs 319518 trace, 319722 dense, 321917 A/B): (a) the returned indexer
+top-k covers every prefill token, so requests with prompts above ~45k tokens exceed aiohttp's 2 GiB
+SSE line limit and are dropped from the trace (6 of 16 lost); (b) check `dp_allocations.csv` before
+sweeping: at the default `DP_TOTAL_ROW=0.3` the DP allocation was flat (identical to uniform), so the
+sweep used `DP_TOTAL_ROW=0.15`; (c) `run_per_layer_dp` is pure Python and took ~50 min on 10 traces.
+(d) aiperf (`run_cctraces_aiperf.py`) treats ANY non-empty `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` as
+offline and then rejects local tokenizer paths; export them EMPTY, not "0". (e) GLM-5.2-NVFP4 autotunes
+FlashInfer kernels for ~25 min after weight load; set `READY_ATTEMPTS` (x15 s, default 120) above 200.
+(f) Full-prompt indexer traces are 639 KB per prompt token on GLM (78 layers x 2048 top-k x 4 B). Use
+`--indexer-topk-decode-only` (server) / `--decode-only-trace` (`collect_trace*.py`, env `DECODE_ONLY_TRACE=1`)
+so a trace is output_len x layers x top-k; and shrink the trace server's pool (`MAX_TOTAL_TOKENS=131072` for
+GLM) because the pinned capture buffer is pool_tokens x layers x top-k x 4 B. Then pass no `--kv-budget` row
+(or refit offline) since the tiny pool makes that row violate the per-layer floors. (g) Decode-only curves sit on
+a ~6% compulsory-miss floor; DP gains are a few percent of misses at total_ratio 0.1, none above 0.2. (h) One
+dp arm (wider max per-layer buffer, ratio 0.3) stalled at concurrency 200 with the HiSparse device pool fully
+used and nothing evictable until the 300 s scheduler watchdog killed it (`results/ab_334070/dp/server.log`).
+(i) GLM: the canonical BF16 `zai-org/GLM-5.2` (1.5 TB) does not fit one 4x GB300 node; `zai-org/GLM-5.2-FP8`
+(756 GB) does, with ~87 GB/GPU left, so use `MAX_TOTAL_TOKENS=393216` for the arms. FP8 weight load takes
+~14 min; keep `READY_ATTEMPTS>=400`. Jobs: `.slurm_logs/glm_fp8_{aalcr,cctraces}_job.sh` (+ `glm_fp8_env.sh`).
+(j) Per-layer buffers are NOT physically memory-matched: `alloc_device_buffer` hands every request
+`device_buffer_size` (= max B_l) pool tokens, and a pool token spans all layers, so a dp config with max 1.5x
+mean uses 1.5x the device KV of uniform. Physical width must be <= 32768 (int16 LRU slots). (k) 2026-09-14
+fixes: the non-uniform reserved-slot write is one scatter (was 78 launches/step, 4-6% ITL tax), and the
+swap-in copy moved out of the block-per-request select kernel into `copy_misses_kernel` (swap-in 4.2 -> 2.0
+ms/step; HiSparse AA-LCR throughput +7..+23%). Profile a decode window with `.slurm_logs/profile_arm.py` and
+summarize with `analyze_profile.py`; before/after via a HEAD `git worktree` + `PYTHONPATH`.
+(l) Per-layer swap-in hit/miss counters: `--hisparse-config '{..., "swap_in_stats": true}'` (off by default; zero
+measured cost either way). Read them from `/server_info` -> `internal_states[i].hisparse_swap_in_stats`
+(`/get_internal_state` does not exist) or the decode log's "swap-in hit rate"; runners dump
+`swap_stats_c<conc>.json` when `SWAP_IN_STATS=1`; `.slurm_logs/swap_stats_report.py` tabulates per layer.
+(m) The DP works only when fit budget == served budget: `make_buffer_sizes --total-ratio auto` (needs the
+`dp_meta.json` sidecar run_per_layer_dp now writes) picks the row for the served B_MEAN or falls back to uniform.
+Measured GLM-FP8 AA-LCR @10240 slots: uniform 6.3% misses vs dp 5.6% (-12%), worst layer 0.158 -> 0.096.
 
 ## Architecture
 
