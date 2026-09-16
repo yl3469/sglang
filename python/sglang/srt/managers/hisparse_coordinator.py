@@ -10,6 +10,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
+from sglang.srt.managers.hisparse_layer_buffers import HiSparseLayerBuffers
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -130,6 +131,12 @@ class HiSparseCoordinator:
             self.mem_pool_device: HiSparseDSATokenToKVPool = (
                 self.token_to_kv_pool_allocator.get_kvcache()
             )
+            # With physically per-layer buffers the shared (resident-mode) width
+            # is the layout's page-aligned max capacity.
+            if self.mem_pool_device.buffer_layout is not None:
+                self.device_buffer_size = (
+                    self.mem_pool_device.buffer_layout.shared_width
+                )
             self.mem_pool_host = MLATokenToKVPoolHost(
                 device_pool=self.mem_pool_device,
                 host_to_device_ratio=host_to_device_ratio,
@@ -286,6 +293,25 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
 
+        # Per-layer private buffer regions (DSA path only; DSv4 keeps shared rows).
+        self.layer_buffers: Optional[HiSparseLayerBuffers] = None
+        if not self.is_dsv4_hisparse and self.mem_pool_device.buffer_layout is not None:
+            layout = self.mem_pool_device.buffer_layout
+            if tuple(self.device_buffer_sizes) != layout.buffer_sizes:
+                raise ValueError(
+                    "HiSparse per-layer buffer sizes differ between the coordinator "
+                    f"({self.device_buffer_sizes}) and the KV pool layout "
+                    f"({list(layout.buffer_sizes)})"
+                )
+            self.layer_buffers = HiSparseLayerBuffers(
+                layout=layout,
+                mem_pool_device=self.mem_pool_device,
+                device=device,
+                token_locs=self.req_device_buffer_token_locs,
+                tokens=self.req_device_buffer_tokens,
+                lru_slots=self.lru_slots,
+            )
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
@@ -312,25 +338,6 @@ class HiSparseCoordinator:
                 host_tokens / host_capacity if host_capacity > 0 else 0.0
             ),
         )
-
-    def get_swap_in_stats(self, max_age_s: float = 1.0) -> HiSparseSwapInStats:
-        """Read back the per-layer swap-in counters (one device sync, cached)."""
-        if self.swap_in_stats is None:
-            zeros = [0] * self.layer_num
-            return HiSparseSwapInStats(misses=zeros, hits=zeros, requests=zeros)
-        now = time.monotonic()
-        if (
-            self._swap_in_stats_cache is None
-            or now - self._swap_in_stats_cache_time > max_age_s
-        ):
-            rows = self.swap_in_stats.cpu().tolist()
-            self._swap_in_stats_cache = HiSparseSwapInStats(
-                misses=[r[0] for r in rows],
-                hits=[r[1] for r in rows],
-                requests=[r[2] for r in rows],
-            )
-            self._swap_in_stats_cache_time = now
-        return self._swap_in_stats_cache
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
@@ -385,7 +392,7 @@ class HiSparseCoordinator:
           buffer.  In the staging path this is correct (prefill filled the buffer),
           but here the buffer is empty.
         """
-        self.alloc_device_buffer(req)
+        self.alloc_device_buffer(req, device_rows_valid=False)
 
         host_len = self.host_token_len(req.kv.kv_allocated_len)
         if host_len <= self.device_buffer_size:
@@ -411,21 +418,44 @@ class HiSparseCoordinator:
         return kv_allocated_len
 
     def _preload_to_device_buffer(self, req: Req) -> None:
-        """Preload all tokens from host pool into the device buffer."""
+        """Preload tokens from the host pool into the device buffer (per layer).
+
+        Resident layers get all ``n`` tokens at their shared rows; LRU-mode
+        layers (``B_l < n``) get tokens ``[0, B_l)`` at their private rows.
+        """
         n = self.host_token_len(req.kv.kv_allocated_len)
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
-        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
+        req_idx = req.req_pool_idx
+        host_indices = self.req_to_host_pool[req_idx, :n]
+        device_locs = self.req_to_device_buffer[req_idx, :n]
 
         for layer_id in range(self.mem_pool_device.layer_num):
+            if self.layer_buffers is not None and self.layer_buffers.is_lru(
+                layer_id, req_idx
+            ):
+                b = self.device_buffer_sizes[layer_id]
+                dst = self.layer_buffers.private_rows(layer_id, req_idx).to(torch.int64)
+                src = host_indices[:b]
+                self.req_device_buffer_tokens[layer_id, req_idx, :b] = (
+                    self._device_buffer_arange_i32[:b]
+                )
+            else:
+                dst = device_locs
+                src = host_indices
             self.mem_pool_host.load_to_device_per_layer(
                 self.mem_pool_device,
-                host_indices,
-                device_locs,
+                src,
+                dst,
                 layer_id,
                 io_backend="kernel",
             )
 
-    def alloc_device_buffer(self, req: Req) -> None:
+    def alloc_device_buffer(self, req: Req, *, device_rows_valid: bool = True) -> None:
+        """Recycle the request's context rows into its shared device buffer.
+
+        ``device_rows_valid`` is False on the direct-to-host path, where the
+        rows hold no KV yet (per-layer buffers then start cold instead of being
+        warmed from them).
+        """
         if self.is_dsv4_hisparse:
             allocated_len = req.extend_range.end
             alloc_size = self.padded_buffer_size
@@ -471,6 +501,60 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
+
+        if self.layer_buffers is not None:
+            seq_len = self.host_token_len(allocated_len)
+            self.layer_buffers.admit(
+                req.req_pool_idx,
+                seq_len,
+                self.req_to_device_buffer[req.req_pool_idx, :alloc_size],
+                warm=device_rows_valid,
+            )
+            if seq_len > self.device_buffer_size:
+                # Every layer is in LRU mode: the shared slots are no longer read.
+                self._release_shared_rows(req.req_pool_idx)
+
+    def _release_shared_rows(self, req_idx: int) -> None:
+        """Return a request's shared buffer rows [0, shared_width) to the pool;
+        the reserved page at column shared_width stays."""
+        width = self.device_buffer_size
+        rows = self.req_to_device_buffer[req_idx, :width]
+        rows = torch.unique(rows[rows > 0])
+        if rows.numel() > 0:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(rows)
+        self.req_to_device_buffer[req_idx, :width] = 0
+        self.layer_buffers.mark_released(req_idx)
+
+    def _advance_layer_modes(
+        self, seq_lens_cpu: torch.Tensor, req_pool_indices_cpu: torch.Tensor
+    ) -> None:
+        """Per decode step: move layers whose B_l was just exceeded into LRU mode
+        and release the shared rows once every layer has moved."""
+        if self.layer_buffers is None:
+            return
+        transitions = []
+        releases = []
+        for i in range(len(seq_lens_cpu)):
+            req_idx = int(req_pool_indices_cpu[i])
+            seq_len = int(seq_lens_cpu[i])
+            if self.layer_buffers.needs_transition(req_idx, seq_len):
+                transitions.append((req_idx, seq_len))
+            if self.layer_buffers.should_release_shared(req_idx, seq_len):
+                releases.append(req_idx)
+        if transitions:
+            # The in-flight forward may still read the old slot locs and write
+            # the newest token into a shared row we are about to copy.
+            if self.decode_producer_stream is not None:
+                device_module.current_stream().wait_stream(self.decode_producer_stream)
+            width = self.device_buffer_size
+            for req_idx, seq_len in transitions:
+                self.layer_buffers.advance(
+                    req_idx, seq_len, self.req_to_device_buffer[req_idx, :width]
+                )
+        if releases:
+            self.wait_for_pending_backup()
+            for req_idx in releases:
+                self._release_shared_rows(req_idx)
 
     def _grow_device_buffers(
         self,
@@ -618,6 +702,7 @@ class HiSparseCoordinator:
             reserved_buffer_loc = self._grow_device_buffers(
                 seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
             )
+            self._advance_layer_modes(seq_lens_cpu, req_pool_indices_cpu)
             self._write_reserved_token_locs(req_pool_indices, reserved_buffer_loc)
 
             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
@@ -813,8 +898,11 @@ class HiSparseCoordinator:
                 f"out of range for seq_len={seq_len}"
             )
 
-            if seq_len <= self.device_buffer_size:
-                device_indices = self.req_to_device_buffer[req_idx, selected_tokens]
+            if seq_len <= self.device_buffer_sizes[layer_id]:
+                # Resident: slot t holds token t (shared or private rows alike).
+                device_indices = self.req_device_buffer_token_locs[
+                    layer_id, req_idx, selected_tokens
+                ].to(torch.int64)
             else:
                 device_indices = torch.empty(
                     top_n, dtype=torch.int64, device=self.device
@@ -840,7 +928,11 @@ class HiSparseCoordinator:
                             f"missing host backup at token positions {bad_positions}"
                         )
 
-                    buffer_locs = self.req_to_device_buffer[req_idx, :num_to_load]
+                    # Scratch rows: this layer's buffer slots (private rows in
+                    # LRU mode, the shared rows otherwise).
+                    buffer_locs = self.req_device_buffer_token_locs[
+                        layer_id, req_idx, :num_to_load
+                    ].to(torch.int64)
                     device_indices[needs_host_load] = buffer_locs
 
                     self.mem_pool_host.load_to_device_per_layer(
@@ -940,6 +1032,8 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        if self.layer_buffers is not None:
+            self.layer_buffers.reset(req.req_pool_idx)
 
     def swap_in_selected_pages(
         self,

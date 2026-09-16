@@ -901,5 +901,269 @@ class TestHiSparsePerLayerBufferRegions(unittest.TestCase):
         self.assertTrue(torch.all(pool.kv_buffer[1][dst] == 0))
 
 
+class TestHiSparseResidentLruSplit(TestHiSparseUnit):
+    """Run the whole coordinator suite on a heterogeneous per-layer layout
+    (B = (256, 512)) and add the resident/LRU split checks.
+
+    A layer stays on the request's shared rows while ``seq_len <= B_l`` and
+    moves to its private rows (with a warm copy of tokens ``[0, B_l)``) once
+    ``seq_len > B_l``; the shared rows go back to the pool after every layer
+    has moved and the last resident-slot token has been backed up.
+    """
+
+    BUFFER_SIZES = (256, 512)
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+        from sglang.srt.mem_cache.hisparse_buffer_layout import HiSparseBufferLayout
+        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        cls.layout = HiSparseBufferLayout.build(
+            context_rows=SIZE,
+            page_size=cls.page_size,
+            layer_num=LAYER_NUM,
+            buffer_sizes=cls.BUFFER_SIZES,
+            num_slots=cls.req_to_token_pool.req_to_token.shape[0],
+        )
+        cls.device_pool = HiSparseDSATokenToKVPool(
+            size=SIZE,
+            page_size=cls.page_size,
+            kv_lora_rank=KV_LORA_RANK,
+            dtype=torch.bfloat16,
+            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+            layer_num=LAYER_NUM,
+            device="cuda",
+            index_head_dim=128,
+            enable_memory_saver=False,
+            kv_cache_dim=KV_CACHE_DIM,
+            host_to_device_ratio=HOST_TO_DEVICE_RATIO,
+            buffer_layout=cls.layout,
+        )
+        cls.allocator = HiSparseTokenToKVPoolAllocator(
+            size=SIZE,
+            page_size=cls.page_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+            kvcache=cls.device_pool,
+            need_sort=False,
+            host_to_device_ratio=HOST_TO_DEVICE_RATIO,
+        )
+        cls.coordinator = HiSparseCoordinator(
+            req_to_token_pool=cls.req_to_token_pool,
+            token_to_kv_pool_allocator=cls.allocator,
+            top_k=TOP_K,
+            device_buffer_size=DEVICE_BUFFER_SIZE,
+            device_buffer_sizes=list(cls.BUFFER_SIZES),
+            device="cuda",
+            tp_group=cls.tp_group,
+            host_to_device_ratio=HOST_TO_DEVICE_RATIO,
+        )
+
+    def setUp(self):
+        super().setUp()
+        for req_idx in range(MAX_NUM_REQS):
+            self.coordinator.layer_buffers.reset(req_idx)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _admit_with_patterns(self, req, fill_len):
+        """Staging-style admission of a prefilled request whose device rows
+        and host slots hold the per-layer test patterns."""
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+        self._populate_host_pool(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+        self.coordinator._skip_first_backup[req.req_pool_idx] = True
+        return kv_loc
+
+    def _decode_step(self, req, seq_len):
+        """Allocate the logical slot for token ``seq_len-1`` and run the
+        scheduler-side decode bookkeeping for it."""
+        device = self.allocator.device
+        last_loc = self.req_to_token_pool.req_to_token[req.req_pool_idx, seq_len - 2]
+        out_loc = self.allocator.alloc_decode(
+            seq_lens=torch.tensor([seq_len], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
+            last_loc=last_loc.view(1),
+        )
+        self.assertIsNotNone(out_loc)
+        self.req_to_token_pool.write((req.req_pool_idx, seq_len - 1), out_loc)
+        req.kv.kv_allocated_len = seq_len
+        req.kv_committed_len = seq_len
+        self.coordinator.map_last_loc_to_buffer(
+            seq_lens=torch.tensor([seq_len], dtype=torch.int64, device=device),
+            out_cache_loc=out_loc,
+            req_pool_indices=torch.tensor(
+                [req.req_pool_idx], dtype=torch.int64, device=device
+            ),
+            seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([req.req_pool_idx], dtype=torch.int64),
+        )
+        return out_loc
+
+    def _assert_private_warm(self, layer_id, req_idx, n_check):
+        """Layer ``layer_id`` is in LRU mode on its private rows and slots
+        ``[0, n_check)`` hold tokens ``[0, n_check)`` with the right KV."""
+        b = self.BUFFER_SIZES[layer_id]
+        locs = self.coordinator.req_device_buffer_token_locs[layer_id, req_idx, :b]
+        self.assertTrue(torch.all(locs >= self.layout.region_start))
+        self.assertTrue(
+            torch.equal(
+                locs.to(torch.int64),
+                self.layout.slot_row_start(layer_id, req_idx)
+                + torch.arange(b, dtype=torch.int64, device=locs.device),
+            )
+        )
+        tokens = self.coordinator.req_device_buffer_tokens[layer_id, req_idx, :b]
+        self.assertTrue(
+            torch.equal(tokens.cpu(), torch.arange(b, dtype=torch.int32)),
+            f"layer {layer_id} warm tokens",
+        )
+        got = self.device_pool.kv_buffer[layer_id][locs[:n_check].to(torch.int64)]
+        got = got.reshape(n_check, -1)[:, 0].float().cpu()
+        want = torch.tensor([self._kv_pattern(layer_id, i) for i in range(n_check)])
+        self.assertTrue(torch.equal(got, want), f"layer {layer_id} warm KV")
+
+    # ------------------------------------------------------------------
+    # Tests
+    # ------------------------------------------------------------------
+    def test_admission_splits_layers_by_capacity(self):
+        """seq_len=320 with B=(256,512): layer 0 goes LRU (warm), layer 1 stays
+        resident on the shared rows."""
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size * 5  # 320 > 256, <= 512
+        req = _make_req("split-admit", list(range(fill_len)))
+        kv_loc = self._admit_with_patterns(req, fill_len)
+        c = self.coordinator
+        req_idx = req.req_pool_idx
+
+        self.assertEqual(c.layer_buffers.lru_layer_count(req_idx), 1)
+        self.assertTrue(c.layer_buffers.is_lru(0, req_idx))
+        self.assertFalse(c.layer_buffers.is_lru(1, req_idx))
+        self.assertFalse(c.layer_buffers.shared_released(req_idx))
+        self._assert_private_warm(0, req_idx, n_check=256)
+
+        locs1 = c.req_device_buffer_token_locs[1, req_idx, :fill_len]
+        self.assertTrue(torch.all(locs1 < self.layout.region_start))
+        self.assertTrue(
+            torch.equal(
+                locs1.to(torch.int64),
+                c.req_to_device_buffer[req_idx, :fill_len].to(torch.int64),
+            )
+        )
+
+        # The kernel must serve both layers correctly from their own rows.
+        rpi, sls = self._make_batch_tensors([req], [fill_len])
+        for layer_id in range(LAYER_NUM):
+            tokens = self._build_topk_tokens(fill_len - 1)
+            batch = tokens.unsqueeze(0)
+            locs = self._swap_in_selected_pages(rpi, sls, batch, layer_id)
+            self._assert_kv_correct(
+                locs[0], tokens, layer_id, count=TOP_K, msg=f"split L{layer_id}: "
+            )
+            if fill_len <= self.BUFFER_SIZES[layer_id]:
+                # The oracle is only slot-stable for resident layers; in LRU
+                # mode it reloads into the first slots and clobbers the rows
+                # the kernel just filled (true for shared rows as well).
+                self._assert_matches_naive(
+                    rpi, sls, batch, locs, layer_id, msg=f"split L{layer_id}: "
+                )
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "split_admit")
+
+    def test_transition_and_release_return_shared_rows(self):
+        """Decode from 320 to 580: layer 1 moves to its private rows at
+        seq_len 513 and the shared rows are freed at seq_len 514."""
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size * 5
+        req = _make_req("split-decode", list(range(fill_len)))
+        kv_loc = self._admit_with_patterns(req, fill_len)
+        c = self.coordinator
+        req_idx = req.req_pool_idx
+        shared_width = self.layout.shared_width
+        self.assertEqual(shared_width, DEVICE_BUFFER_SIZE)
+
+        decode_locs = []
+        for seq_len in range(fill_len + 1, shared_width + 69):
+            hisparse_free_before = (
+                self.allocator.hisparse_attn_allocator.available_size()
+            )
+            decode_locs.append(self._decode_step(req, seq_len))
+            if seq_len <= shared_width:
+                self.assertEqual(c.layer_buffers.lru_layer_count(req_idx), 1, seq_len)
+                self.assertFalse(c.layer_buffers.shared_released(req_idx), seq_len)
+            elif seq_len == shared_width + 1:
+                self.assertEqual(c.layer_buffers.lru_layer_count(req_idx), 2, seq_len)
+                self.assertFalse(c.layer_buffers.shared_released(req_idx), seq_len)
+                self._assert_private_warm(1, req_idx, n_check=fill_len)
+            elif seq_len == shared_width + 2:
+                self.assertTrue(c.layer_buffers.shared_released(req_idx), seq_len)
+                torch.cuda.synchronize()
+                self.assertEqual(
+                    self.allocator.hisparse_attn_allocator.available_size(),
+                    hisparse_free_before + shared_width,
+                    "shared rows must return to the pool on release",
+                )
+                self.assertTrue(
+                    torch.all(c.req_to_device_buffer[req_idx, :shared_width] == 0)
+                )
+                self.assertTrue(
+                    torch.all(c.req_to_device_buffer[req_idx, shared_width] > 0)
+                )
+            else:
+                self.assertTrue(c.layer_buffers.shared_released(req_idx), seq_len)
+
+        # Post-release: the newest token still lands in the reserved row and
+        # both layers serve top-k from private rows + the reserved slot.
+        seq_len = shared_width + 68
+        rpi, sls = self._make_batch_tensors([req], [seq_len])
+        for layer_id in range(LAYER_NUM):
+            tokens = self._build_topk_tokens(fill_len)
+            batch = tokens.unsqueeze(0)
+            locs = self._swap_in_selected_pages(rpi, sls, batch, layer_id)
+            self.assertTrue(torch.all(locs[0, :TOP_K] >= 0))
+            self._assert_kv_correct(
+                locs[0],
+                tokens,
+                layer_id,
+                count=TOP_K,
+                msg=f"post-release L{layer_id}: ",
+            )
+
+        self._cleanup_req(req, torch.cat([kv_loc, torch.cat(decode_locs)]))
+        self._assert_sizes_restored(initial, "split_decode")
+
+    def test_long_admission_goes_straight_to_lru_and_releases(self):
+        """seq_len > shared_width at admission: every layer is LRU (warm) and
+        the shared rows are released immediately."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size
+        req = _make_req("split-long", list(range(fill_len)))
+        kv_loc = self._admit_with_patterns(req, fill_len)
+        c = self.coordinator
+        req_idx = req.req_pool_idx
+
+        self.assertEqual(c.layer_buffers.lru_layer_count(req_idx), LAYER_NUM)
+        self.assertTrue(c.layer_buffers.shared_released(req_idx))
+        self._assert_private_warm(0, req_idx, n_check=256)
+        self._assert_private_warm(1, req_idx, n_check=512)
+        # Only the reserved page is still held by the request.
+        self.assertEqual(
+            self.allocator.hisparse_attn_allocator.available_size(),
+            initial[1] - self.page_size,
+        )
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "split_long")
+
+
 if __name__ == "__main__":
     unittest.main()
