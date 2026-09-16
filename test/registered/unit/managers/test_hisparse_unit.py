@@ -849,5 +849,57 @@ class TestHiSparseUnit(unittest.TestCase):
         self._assert_sizes_restored(initial, "batch_multiple")
 
 
+class TestHiSparsePerLayerBufferRegions(unittest.TestCase):
+    """The pool appends num_slots * B_l private rows to layer l only, so two
+    layouts with equal slot totals allocate equal bytes."""
+
+    def _pool(self, sizes):
+        from sglang.srt.mem_cache.hisparse_buffer_layout import HiSparseBufferLayout
+        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+
+        layout = HiSparseBufferLayout.build(
+            context_rows=SIZE,
+            page_size=PAGE_SIZE,
+            layer_num=LAYER_NUM,
+            buffer_sizes=sizes,
+            num_slots=MAX_NUM_REQS,
+        )
+        return HiSparseDSATokenToKVPool(
+            size=SIZE,
+            page_size=PAGE_SIZE,
+            kv_lora_rank=KV_LORA_RANK,
+            dtype=torch.bfloat16,
+            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+            layer_num=LAYER_NUM,
+            device="cuda",
+            index_head_dim=128,
+            enable_memory_saver=False,
+            kv_cache_dim=KV_CACHE_DIM,
+            host_to_device_ratio=HOST_TO_DEVICE_RATIO,
+            buffer_layout=layout,
+        )
+
+    def test_layer_rows_and_byte_equality(self):
+        dp = self._pool((256, 512))
+        self.assertEqual(
+            dp.kv_buffer[0].shape[0], SIZE + PAGE_SIZE + MAX_NUM_REQS * 256
+        )
+        self.assertEqual(
+            dp.kv_buffer[1].shape[0], SIZE + PAGE_SIZE + MAX_NUM_REQS * 512
+        )
+        uniform = self._pool((384, 384))
+        self.assertEqual(uniform.get_kv_size_bytes(), dp.get_kv_size_bytes())
+
+    def test_copy_rows_per_layer_moves_only_that_layer(self):
+        pool = self._pool((256, 512))
+        src = torch.tensor([3, 4], device="cuda")
+        dst = torch.tensor([SIZE + PAGE_SIZE, SIZE + PAGE_SIZE + 1], device="cuda")
+        pool.kv_buffer[0][src] = torch.randn_like(pool.kv_buffer[0][src])
+        pool.kv_buffer[1][src] = torch.randn_like(pool.kv_buffer[1][src])
+        pool.copy_rows_per_layer(0, dst, src)
+        self.assertTrue(torch.equal(pool.kv_buffer[0][dst], pool.kv_buffer[0][src]))
+        self.assertTrue(torch.all(pool.kv_buffer[1][dst] == 0))
+
+
 if __name__ == "__main__":
     unittest.main()

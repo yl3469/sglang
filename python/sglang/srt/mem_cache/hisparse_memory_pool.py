@@ -6,6 +6,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.hisparse_buffer_layout import HiSparseBufferLayout
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -41,7 +42,27 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         host_to_device_ratio: int = 2,
+        buffer_layout: Optional[HiSparseBufferLayout] = None,
     ):
+        # Per-layer private device-buffer regions appended to every layer's KV
+        # tensor (see HiSparseBufferLayout). None keeps the stock uniform shape.
+        # Set before super().__init__: the base constructor calls
+        # _create_buffers(), which reads it.
+        if buffer_layout is not None:
+            if (
+                buffer_layout.context_rows != size
+                or buffer_layout.page_size != page_size
+            ):
+                raise ValueError(
+                    f"buffer_layout (context_rows={buffer_layout.context_rows}, "
+                    f"page_size={buffer_layout.page_size}) does not match the pool "
+                    f"(size={size}, page_size={page_size})"
+                )
+            if buffer_layout.layer_num != layer_num:
+                raise ValueError(
+                    f"buffer_layout has {buffer_layout.layer_num} layers, pool has {layer_num}"
+                )
+        self.buffer_layout = buffer_layout
         super().__init__(
             size=size,
             page_size=page_size,
@@ -58,6 +79,43 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             index_buf_size=size * host_to_device_ratio,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
+
+    def _create_buffers(self):
+        if self.buffer_layout is None:
+            super()._create_buffers()
+            return
+        from contextlib import nullcontext
+
+        from sglang.srt.mem_cache.memory_pool import GPU_MEMORY_TYPE_KV_CACHE
+
+        # Same allocation context as MLATokenToKVPool._create_buffers, but layer
+        # l gets (size + page_size) shared rows + num_slots * B_l private rows.
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.kv_buffer = [
+                    torch.zeros(
+                        (self.buffer_layout.layer_rows(layer), 1, self.kv_cache_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for layer in range(self.layer_num)
+                ]
+
+    def copy_rows_per_layer(
+        self, layer_id: int, dst_indices: torch.Tensor, src_indices: torch.Tensor
+    ) -> None:
+        """Device-to-device row copy within one layer's KV tensor (disjoint rows).
+
+        Used once per request and layer when a buffer leaves resident mode, so
+        plain indexing is fine (the JIT hicache kernel requires element sizes
+        that are multiples of 128 B, which DSA fp8 rows are not).
+        """
+        buf = self.kv_buffer[layer_id - self.start_layer]
+        buf[dst_indices] = buf[src_indices]
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (

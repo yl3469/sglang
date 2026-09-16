@@ -132,6 +132,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        # HiSparse (DSA path): the per-layer private device-buffer regions are a
+        # fixed cost (num_req_slots * sum_l B_l rows) taken off the KV budget
+        # before the per-token cell size divides the rest.
+        self._hisparse_buffer_bytes = self._hisparse_buffer_bytes_for(kvc, num_layers)
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -179,6 +183,49 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
                 )
+
+    def _mla_row_bytes(self, kvc: KVCacheConfigurator) -> int:
+        """Bytes of one token's latent KV in ONE layer (the unit of a buffer row)."""
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+
+        return calculate_mla_kv_cache_dim(
+            model_config=kvc.model_config,
+            kv_cache_dtype=kvc.kv_cache_dtype,
+            server_args=kvc.server_args,
+        ) * torch._utils._element_size(kvc.kv_cache_dtype)
+
+    def _hisparse_buffer_bytes_for(
+        self, kvc: KVCacheConfigurator, num_layers: int
+    ) -> int:
+        """Fixed bytes of the per-layer HiSparse device-buffer regions, or 0.
+
+        Only the DSA path (GLM-DSA / DeepSeek-V3.2) has physically per-layer
+        buffers; DeepSeek-V4's compressed pool still shares rows.
+        """
+        sa = kvc.server_args
+        if not sa.enable_hisparse or not is_deepseek_dsa(kvc.model_config.hf_config):
+            return 0
+        if sa.max_running_requests is None:
+            raise ValueError(
+                "HiSparse per-layer device buffers reserve max_running_requests x "
+                "sum(B_l) rows per layer up front; pass --max-running-requests."
+            )
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        cfg = parse_hisparse_config(sa)
+        sizes = (
+            tuple(cfg.device_buffer_sizes)
+            if cfg.device_buffer_sizes is not None
+            else (cfg.device_buffer_size,) * num_layers
+        )
+        # Mirrors ReqToTokenPool: per-worker requests (+ decode extra slots) plus
+        # the padding row at index 0.
+        num_slots = sa.max_running_requests // kvc.ps.attn_dp_size + 1
+        if sa.disaggregation_mode == "decode":
+            num_slots += sa.disaggregation_decode_extra_slots or 0
+        return num_slots * sum(sizes) * self._mla_row_bytes(kvc)
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
@@ -317,6 +364,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        if self._hisparse_buffer_bytes:
+            if self._hisparse_buffer_bytes >= available_bytes:
+                raise ValueError(
+                    f"HiSparse per-layer device buffers need "
+                    f"{self._hisparse_buffer_bytes / 2**30:.2f} GB but only "
+                    f"{available_bytes / 2**30:.2f} GB is available for KV cache; "
+                    "lower --max-running-requests or the per-layer buffer sizes."
+                )
+            logger.info(
+                "HiSparse per-layer device buffers reserve %.2f GB of KV memory",
+                self._hisparse_buffer_bytes / 2**30,
+            )
+            available_bytes -= self._hisparse_buffer_bytes
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size

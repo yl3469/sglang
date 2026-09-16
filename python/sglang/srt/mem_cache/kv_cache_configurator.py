@@ -856,6 +856,9 @@ class KVCacheConfigurator:
         elif self.use_mla_backend and is_dsa_model:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
+                # Rows of the request table (size + the padding row at index 0):
+                # the coordinator indexes buffers by req_pool_idx.
+                num_req_slots=req_to_token_pool.req_to_token.shape[0],
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
@@ -1128,7 +1131,9 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
-    def _build_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+    def _build_dsa_kv_pool(
+        self, *, max_total_num_tokens: int, num_req_slots: int
+    ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
         (
@@ -1140,9 +1145,27 @@ class KVCacheConfigurator:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
-                self.server_args
-            ).host_to_device_ratio
+            hisparse_cfg = parse_hisparse_config(self.server_args)
+            pool_kwargs["host_to_device_ratio"] = hisparse_cfg.host_to_device_ratio
+            # Physically per-layer device buffers: one private region per layer
+            # sized num_req_slots * B_l (uniform B when no per-layer sizes given).
+            from sglang.srt.mem_cache.hisparse_buffer_layout import (
+                HiSparseBufferLayout,
+            )
+
+            layer_num = self.layer_info.num_effective_layers
+            buffer_sizes = (
+                tuple(hisparse_cfg.device_buffer_sizes)
+                if hisparse_cfg.device_buffer_sizes is not None
+                else (hisparse_cfg.device_buffer_size,) * layer_num
+            )
+            pool_kwargs["buffer_layout"] = HiSparseBufferLayout.build(
+                context_rows=max_total_num_tokens,
+                page_size=get_schedule().page_size,
+                layer_num=layer_num,
+                buffer_sizes=buffer_sizes,
+                num_slots=num_req_slots,
+            )
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (
