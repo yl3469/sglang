@@ -175,56 +175,6 @@ def build_buffer_sizes(
     return uniform, dp, layer_ids
 
 
-def read_target_row(
-    csv_path: str, target_miss_rate: float
-) -> Tuple[Dict[int, float], float, float]:
-    """Read the ``dp_target_allocations.csv`` row closest to ``target_miss_rate``.
-
-    Returns ``(per_layer_ratio, uniform_mean_ratio, chosen_target)``.
-    """
-    with open(csv_path) as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
-        raise ValueError(f"{csv_path} has no rows")
-    row = min(rows, key=lambda r: abs(float(r["target_miss_rate"]) - target_miss_rate))
-    if row["uniform_mean_ratio"] == "":
-        raise ValueError(
-            f"target {row['target_miss_rate']} has no uniform budget that meets it; "
-            "measure larger ratios or pick a looser target"
-        )
-    layer_ratio = {
-        int(k[len("layer_") :]): float(v)
-        for k, v in row.items()
-        if k.startswith("layer_")
-    }
-    return layer_ratio, float(row["uniform_mean_ratio"]), float(row["target_miss_rate"])
-
-
-def build_target_buffer_sizes(
-    layer_ratio: Dict[int, float],
-    uniform_mean_ratio: float,
-    mean_slot_ctx0: int,
-    top_k: int,
-    page_size: int,
-) -> Tuple[List[int], List[int], List[int]]:
-    """(uniform, dp, layer_ids) buffer sizes for an iso-miss-rate comparison.
-
-    Unlike :func:`build_buffer_sizes` the totals are NOT matched: both arms
-    meet the same predicted miss rate and the DP arm is expected to use fewer
-    rows (bytes). Ratios are turned into compressed slots via the mean context
-    slot count, floored at ``top_k`` and page-aligned.
-    """
-    layer_ids = sorted(layer_ratio)
-    floor = _round_to_page(top_k, page_size)
-
-    def slots(ratio: float) -> int:
-        return max(_round_to_page(int(round(ratio * mean_slot_ctx0)), page_size), floor)
-
-    uniform = [slots(uniform_mean_ratio)] * len(layer_ids)
-    dp = [slots(layer_ratio[l]) for l in layer_ids]
-    return uniform, dp, layer_ids
-
-
 def _write(out_dir: str, name: str, sizes: Sequence[int]) -> str:
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"buffer_sizes_{name}.json")
@@ -235,16 +185,7 @@ def _write(out_dir: str, name: str, sizes: Sequence[int]) -> str:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dp-csv", default=None, help="dp_allocations.csv (matched-total mode)"
-    )
-    parser.add_argument(
-        "--target-csv",
-        default=None,
-        help="dp_target_allocations.csv (iso-miss-rate mode: uniform and dp arms "
-        "meet the same predicted miss rate; dp uses fewer rows).",
-    )
-    parser.add_argument("--target-miss-rate", type=float, default=None)
+    parser.add_argument("--dp-csv", required=True)
     parser.add_argument(
         "--total-ratio",
         default=None,
@@ -255,20 +196,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument(
         "--b-mean",
         type=int,
-        default=None,
-        help="Uniform per-layer device buffer in COMPRESSED slots (baseline; "
-        "matched-total mode).",
+        required=True,
+        help="Uniform per-layer device buffer in COMPRESSED slots (baseline).",
     )
     parser.add_argument("--top-k", type=int, default=512)
     parser.add_argument("--page-size", type=int, default=64)
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args(argv)
-
-    if args.target_csv is not None:
-        _main_target_mode(args)
-        return
-    if args.dp_csv is None or args.b_mean is None:
-        parser.error("--dp-csv and --b-mean are required unless --target-csv is given")
 
     if args.total_ratio is None or args.total_ratio == "auto":
         served = (
@@ -296,46 +230,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     assert sum(uniform) == sum(dp), (sum(uniform), sum(dp))
     print("  (totals matched: uniform and DP use identical device memory)")
-    print("\nUse with:")
-    print(
-        f'  UNIFORM: --hisparse-config \'{{"top_k":{args.top_k},'
-        f'"device_buffer_sizes_path":"{up}"}}\''
-    )
-    print(
-        f'  DP:      --hisparse-config \'{{"top_k":{args.top_k},'
-        f'"device_buffer_sizes_path":"{dpp}"}}\''
-    )
-
-
-def _main_target_mode(args) -> None:
-    if args.target_miss_rate is None:
-        raise SystemExit("--target-miss-rate is required with --target-csv")
-    meta_path = os.path.join(
-        os.path.dirname(os.path.abspath(args.target_csv)), "dp_meta.json"
-    )
-    with open(meta_path) as f:
-        mean_slot_ctx0 = int(json.load(f)["mean_slot_ctx0"])
-    layer_ratio, uniform_ratio, chosen = read_target_row(
-        args.target_csv, args.target_miss_rate
-    )
-    uniform, dp, layer_ids = build_target_buffer_sizes(
-        layer_ratio, uniform_ratio, mean_slot_ctx0, args.top_k, args.page_size
-    )
-    up = _write(args.out_dir, "uniform", uniform)
-    dpp = _write(args.out_dir, "dp", dp)
-    saving = 1.0 - sum(dp) / sum(uniform)
-    print(
-        f"Using dp_target_allocations row target={chosen:g}, {len(layer_ids)} layers, "
-        f"mean context slots {mean_slot_ctx0}"
-    )
-    print(f"  uniform total={sum(uniform)} B={uniform[0]}  -> {up}")
-    print(
-        f"  dp      total={sum(dp)} min={min(dp)} max={max(dp)} "
-        f"mean={sum(dp) / len(dp):.0f}  -> {dpp}"
-    )
-    print(
-        f"  dp uses {saving * 100:.1f}% fewer buffer rows (bytes) at the same predicted miss rate"
-    )
     print("\nUse with:")
     print(
         f'  UNIFORM: --hisparse-config \'{{"top_k":{args.top_k},'
