@@ -212,7 +212,13 @@ class Server(msgspec.Struct, kw_only=True):
                 cmd, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True
             )
 
-    def wait_ready(self, attempts: int = 120, interval: float = 15.0) -> bool:
+    def wait_ready(
+        self, attempts: Optional[int] = None, interval: float = 15.0
+    ) -> bool:
+        # READY_ATTEMPTS x 15 s; default 30 min. NVFP4 MoE models autotune
+        # (flashinfer trtllm kernels) for 30+ min on first launch.
+        if attempts is None:
+            attempts = env("READY_ATTEMPTS", 120)
         assert self.proc is not None
         for _ in range(attempts):
             if _http_ok(f"{self.base_url}/get_model_info"):

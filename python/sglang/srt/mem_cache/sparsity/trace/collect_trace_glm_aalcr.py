@@ -12,7 +12,7 @@ import argparse
 from pathlib import Path
 
 from . import exp_common as ec
-from .collect_trace import collect
+from .collect_trace import add_decode_only_arg, collect
 
 DEFAULT_GLM_MODEL = (
     "/scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/"
@@ -29,6 +29,7 @@ def main() -> None:
         max_running_requests=ec.env("MAX_RUNNING_REQUESTS", 8),
     )
     p.add_argument("--port", type=int, default=ec.env("PORT", 30000))
+    add_decode_only_arg(p)
     p.add_argument("--index-topk", type=int, default=ec.env("INDEX_TOPK", 2048))
     p.add_argument(
         "--num-indexer-layers", type=int, default=ec.env("NUM_INDEXER_LAYERS", 21)

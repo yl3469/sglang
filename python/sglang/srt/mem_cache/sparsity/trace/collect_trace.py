@@ -19,6 +19,19 @@ from pathlib import Path
 from . import exp_common as ec
 
 
+def add_decode_only_arg(p: argparse.ArgumentParser) -> None:
+    """--decode-only-trace / DECODE_ONLY_TRACE=1: capture only decode-step
+    selections (server flag --indexer-topk-decode-only). Required for models
+    whose per-token payload is large (GLM: 78 layers x 2048 topk = 639 KB per
+    prompt token); the full-prompt capture exceeds the client's 2 GiB SSE line
+    limit past ~45k (DSv4) / ~3k (GLM) prompt tokens."""
+    p.add_argument(
+        "--decode-only-trace",
+        action="store_true",
+        default=bool(ec.env("DECODE_ONLY_TRACE", 0)),
+    )
+
+
 def collect(
     args: argparse.Namespace,
     dataset_jsonl: str,
@@ -37,7 +50,8 @@ def collect(
         max_total_tokens=args.max_total_tokens,
         max_running_requests=args.max_running_requests,
         log_path=results_dir / "server.log",
-        extra_flags=["--enable-hisparse", "--enable-return-indexer-topk"],
+        extra_flags=["--enable-hisparse", "--enable-return-indexer-topk"]
+        + (["--indexer-topk-decode-only"] if args.decode_only_trace else []),
     )
     server.launch()
     try:
@@ -123,6 +137,7 @@ def main() -> None:
         max_running_requests=ec.env("MAX_RUNNING_REQUESTS", 8),
     )
     p.add_argument("--port", type=int, default=ec.env("PORT", 30000))
+    add_decode_only_arg(p)
     p.add_argument("--index-topk", type=int, default=ec.env("INDEX_TOPK", 512))
     # DSv4-Flash: 43 layers, compress_ratio 4 -> C4A indexer layers on even ids 2..42
     p.add_argument(

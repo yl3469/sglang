@@ -161,11 +161,20 @@ class SchedulerBatchResultProcessor:
         capturer = get_global_indexer_capturer()
         if capturer is None:
             return
-        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+        prompt_len = len(req.origin_input_ids)
+        seqlen = prompt_len + len(req.output_ids_through_stop)
+        # Row i holds the selection made while processing token i, so decode
+        # steps start at prompt_len - 1 (the row that produced the first output).
+        start_len = (
+            max(prompt_len - 1, 0)
+            if get_exec().features.indexer_topk_decode_only
+            else 0
+        )
         req.indexer_topk = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
+            start_len=start_len,
         )
 
     def _maybe_collect_customized_info(

@@ -3330,6 +3330,13 @@ class ServerArgs:
         "Enable returning indexer topk indices of layers with indexer with responses.",
         NS("exec.features"),
     ] = False
+    indexer_topk_decode_only: A[
+        bool,
+        "With --enable-return-indexer-topk, return only the decode-step rows "
+        "(positions >= prompt_len - 1) instead of every prompt token; keeps the "
+        "per-request payload at output_len x layers x topk.",
+        NS("exec.features"),
+    ] = False
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
