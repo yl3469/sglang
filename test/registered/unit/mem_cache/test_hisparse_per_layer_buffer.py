@@ -17,6 +17,7 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.hisparse_buffer_layout import HiSparseBufferLayout
 from sglang.srt.mem_cache.sparsity.factory import _parse_sparse_config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -236,3 +237,71 @@ class TestResolveAndReservedWrite(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHiSparseBufferLayout(CustomTestCase):
+    """Geometry of per-layer buffer regions (derived properties that the
+    coordinator and pool sizing both rely on)."""
+
+    def _layout(self, sizes, page_size=64, num_slots=8, context_rows=2048):
+        return HiSparseBufferLayout.build(
+            context_rows=context_rows,
+            page_size=page_size,
+            layer_num=len(sizes),
+            buffer_sizes=tuple(sizes),
+            num_slots=num_slots,
+        )
+
+    def test_shared_width_is_page_aligned_max(self):
+        # Resident mode reuses the pre-existing single-width path, which
+        # assumed a page-aligned width; B_l themselves need not be aligned.
+        self.assertEqual(self._layout([6144, 2048]).shared_width, 6144)
+        self.assertEqual(self._layout([6000, 2048]).shared_width, 6016)
+        self.assertEqual(self._layout([6000, 2048], page_size=1).shared_width, 6000)
+        self.assertEqual(self._layout([6000, 2048]).padded_buffer_size, 6016 + 64)
+
+    def test_private_regions_never_alias_shared_rows_or_each_other(self):
+        lay = self._layout([256, 512], page_size=64, num_slots=4, context_rows=1000)
+        # Shared region is [0, context_rows + page): private rows start after it.
+        self.assertEqual(lay.region_start, 1000 + 64)
+        for l, b in enumerate(lay.buffer_sizes):
+            starts = [lay.slot_row_start(l, s) for s in range(lay.num_slots)]
+            self.assertEqual(starts[0], lay.region_start)
+            for s in range(1, lay.num_slots):
+                self.assertEqual(starts[s], starts[s - 1] + b)  # contiguous, disjoint
+            self.assertEqual(
+                starts[-1] + b, lay.layer_rows(l)
+            )  # region ends the tensor
+        with self.assertRaises(ValueError):
+            lay.slot_row_start(0, lay.num_slots)
+
+    def test_lru_layer_count_boundary_is_strictly_greater(self):
+        # seq_len == B_l is still resident (fast path: slot t holds token t);
+        # the first LRU step is seq_len == B_l + 1.
+        lay = self._layout([512, 256, 512, 1024])
+        self.assertEqual(lay.layers_by_size, (1, 0, 2, 3))
+        self.assertEqual(lay.lru_layers_for(256), 0)
+        self.assertEqual(lay.lru_layers_for(257), 1)
+        self.assertEqual(lay.lru_layers_for(512), 1)
+        self.assertEqual(lay.lru_layers_for(513), 3)
+        self.assertEqual(lay.lru_layers_for(1025), 4)
+
+    def test_equal_slot_totals_mean_equal_bytes(self):
+        uniform = self._layout([384, 384])
+        dp = self._layout([256, 512])
+        self.assertEqual(uniform.buffer_bytes(656), dp.buffer_bytes(656))
+        self.assertEqual(dp.buffer_bytes(656), 8 * (256 + 512) * 656)
+        # ...even though the widest layer's tensor differs.
+        self.assertNotEqual(uniform.layer_rows(1), dp.layer_rows(1))
+
+    def test_validation(self):
+        with self.assertRaises(ValueError):  # length mismatch
+            HiSparseBufferLayout.build(
+                context_rows=8, page_size=1, layer_num=2, buffer_sizes=(1,), num_slots=1
+            )
+        with self.assertRaises(ValueError):
+            self._layout([32769, 512])
+        with self.assertRaises(ValueError):
+            self._layout([0, 512])
+        with self.assertRaises(ValueError):
+            self._layout([512], num_slots=0)
