@@ -101,6 +101,7 @@ def _run_kernel(
     req_pool_indices: torch.Tensor | None = None,
     num_real_reqs: int | None = None,
     output_fill_value: int = -1,
+    layer_stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size = top_k_tokens.shape[0]
     if req_pool_indices is None:
@@ -130,6 +131,7 @@ def _run_kernel(
         page_size=1,
         block_size=256,
         num_real_reqs=torch.tensor([num_real_reqs], dtype=torch.int32, device=DEVICE),
+        layer_stats=layer_stats,
     )
     torch.cuda.synchronize()
     return out
@@ -405,6 +407,27 @@ def test_load_cache_to_device_buffer_multiple_misses_copy_all_slots() -> None:
         assert torch.equal(
             state["device_buffer"][loc].cpu(), state["host_cache"][token]
         )
+
+
+def test_load_cache_to_device_buffer_layer_stats_count_misses_and_hits() -> None:
+    # Same scenario as the multiple-misses test: all 4 top-k tokens miss.
+    state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
+    stats = torch.zeros(3, dtype=torch.int64, device=DEVICE)
+    _run_kernel(
+        top_k_tokens=torch.tensor([[4, 5, 6, 7]], dtype=torch.int32, device=DEVICE),
+        seq_len=9,
+        layer_stats=stats,
+        **state,
+    )
+    assert stats.cpu().tolist() == [4, 0, 1]
+    # Second call with the same top-k: everything is now a hit; counters accumulate.
+    _run_kernel(
+        top_k_tokens=torch.tensor([[4, 5, 6, 7]], dtype=torch.int32, device=DEVICE),
+        seq_len=9,
+        layer_stats=stats,
+        **state,
+    )
+    assert stats.cpu().tolist() == [4, 4, 2]
 
 
 def test_load_cache_to_device_buffer_batched_with_padding() -> None:

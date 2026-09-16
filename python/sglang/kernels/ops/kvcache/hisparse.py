@@ -91,6 +91,7 @@ def _load_cache_to_device_buffer_mla(
     page_size: int,
     block_size: int,
     num_real_reqs: torch.Tensor | None,
+    layer_stats: torch.Tensor | None = None,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
@@ -126,6 +127,7 @@ def _load_cache_to_device_buffer_mla(
         seq_lens,
         lru_slots,
         num_real_reqs,
+        empty if layer_stats is None else layer_stats,
         page_size,
         item_size_bytes,
     )
@@ -148,6 +150,7 @@ def load_cache_to_device_buffer_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    layer_stats: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -168,6 +171,7 @@ def load_cache_to_device_buffer_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        layer_stats=layer_stats,
     )
 
 
@@ -188,6 +192,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    layer_stats: torch.Tensor | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -208,4 +213,5 @@ def load_cache_to_device_buffer_dsv4_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        layer_stats=layer_stats,
     )
