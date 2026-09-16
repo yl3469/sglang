@@ -34,7 +34,11 @@ def main() -> None:
             str(ec.RESULTS_ROOT / "3191572/per_layer_budget_dp/dp_allocations.csv"),
         ),
     )
-    p.add_argument("--dp-total-row", type=float, default=ec.env("DP_TOTAL_ROW", 0.3))
+    p.add_argument(
+        "--dp-total-row",
+        default=ec.env("DP_TOTAL_ROW", "0.3"),
+        help="dp_allocations.csv row (ratio) or 'auto' = match the served B_MEAN",
+    )
     p.add_argument("--b-mean", type=int, default=ec.env("B_MEAN", 1024))
     p.add_argument("--page-size", type=int, default=ec.env("PAGE_SIZE_SLOTS", 64))
     p.add_argument(

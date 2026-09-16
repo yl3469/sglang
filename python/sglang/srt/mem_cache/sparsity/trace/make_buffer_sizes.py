@@ -43,8 +43,31 @@ def _round_to_page(x: int, page_size: int) -> int:
     return int(((x + page_size - 1) // page_size) * page_size)
 
 
+# A fitted row is only trusted for a served budget within this relative
+# distance of its total_ratio; beyond it the DP shape is extrapolated onto a
+# budget it was never optimized for (the 0.1-row-served-at-0.04 mistake).
+AUTO_MAX_REL_DISTANCE = 0.25
+
+
+def served_total_ratio(csv_path: str, b_mean: int) -> float:
+    """Served budget as a ratio of context: ``b_mean / mean_slot_ctx0`` from the
+    ``dp_meta.json`` sidecar run_per_layer_dp writes next to the CSV."""
+    meta_path = os.path.join(os.path.dirname(os.path.abspath(csv_path)), "dp_meta.json")
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(
+            f"{meta_path} not found; rerun run_per_layer_dp (it writes the sidecar) "
+            "or pass an explicit --total-ratio"
+        )
+    with open(meta_path) as f:
+        meta = json.load(f)
+    return b_mean / float(meta["mean_slot_ctx0"])
+
+
 def read_dp_row(
-    csv_path: str, total_ratio: Optional[float]
+    csv_path: str,
+    total_ratio: Optional[float],
+    *,
+    served_ratio: Optional[float] = None,
 ) -> Tuple[Dict[int, float], float]:
     """Read one row of dp_allocations.csv.
 
@@ -52,7 +75,10 @@ def read_dp_row(
     maps model-layer id -> allocated capacity ratio. If ``total_ratio`` is None
     the row with the LARGEST DP improvement over uniform is chosen (the most
     informative A/B point); otherwise the row whose ``total_ratio`` matches
-    (closest) is used.
+    (closest) is used. With ``served_ratio`` (auto mode) the closest row is
+    used only if it lies within ``AUTO_MAX_REL_DISTANCE`` of the served budget;
+    otherwise a UNIFORM shape is returned, because no fitted row covers the
+    budget actually served and the DP itself predicts no gain there.
     """
     rows: List[dict] = []
     with open(csv_path) as f:
@@ -61,7 +87,23 @@ def read_dp_row(
     if not rows:
         raise ValueError(f"{csv_path} has no data rows")
 
-    if total_ratio is None:
+    if served_ratio is not None:
+        chosen = min(rows, key=lambda r: abs(float(r["total_ratio"]) - served_ratio))
+        rel = abs(float(chosen["total_ratio"]) - served_ratio) / served_ratio
+        if rel > AUTO_MAX_REL_DISTANCE:
+            print(
+                f"WARNING: served budget ratio {served_ratio:.3f} is {rel:.0%} away "
+                f"from the nearest fitted row ({float(chosen['total_ratio']):g}); "
+                "using a UNIFORM allocation (dp == uniform). Serve above the fitted "
+                "rows' budget or refit with --total-ratios covering it."
+            )
+            layer_ratio = {
+                int(k.split("_", 1)[1]): served_ratio
+                for k in chosen
+                if k.startswith("layer_")
+            }
+            return layer_ratio, served_ratio
+    elif total_ratio is None:
         # Largest (uniform - dp) miss-rate gap.
         def gap(r: dict) -> float:
             return float(r["predicted_uniform_miss_rate"]) - float(
@@ -146,9 +188,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--dp-csv", required=True)
     parser.add_argument(
         "--total-ratio",
-        type=float,
         default=None,
-        help="Which CSV row to use (default: row with largest DP gain).",
+        help="Which CSV row to use: a ratio, 'auto' (= b_mean / mean context "
+        "slots from dp_meta.json, falling back to uniform if no fitted row is "
+        "within 25%% of it), or omitted (row with the largest DP gain).",
     )
     parser.add_argument(
         "--b-mean",
@@ -161,7 +204,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args(argv)
 
-    layer_ratio, chosen = read_dp_row(args.dp_csv, args.total_ratio)
+    if args.total_ratio is None or args.total_ratio == "auto":
+        served = (
+            served_total_ratio(args.dp_csv, args.b_mean)
+            if args.total_ratio == "auto"
+            else None
+        )
+        layer_ratio, chosen = read_dp_row(args.dp_csv, None, served_ratio=served)
+        if served is not None:
+            print(f"auto: served budget ratio {served:.3f} (b_mean={args.b_mean})")
+    else:
+        layer_ratio, chosen = read_dp_row(args.dp_csv, float(args.total_ratio))
     uniform, dp, layer_ids = build_buffer_sizes(
         layer_ratio, args.b_mean, args.top_k, args.page_size
     )

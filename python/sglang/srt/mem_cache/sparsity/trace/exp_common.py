@@ -33,7 +33,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Union
 
 import msgspec
 
@@ -333,7 +333,7 @@ def hisparse_config(top_k: int, buffer_sizes_path: str) -> str:
 def build_buffer_configs(
     dp_csv: str,
     cfg_dir: Path,
-    total_ratio: float,
+    total_ratio: Union[float, str],
     b_mean: int,
     top_k: int,
     page_size: int,

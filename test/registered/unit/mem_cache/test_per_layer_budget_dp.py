@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 
 from sglang.srt.mem_cache.sparsity.per_layer_budget_dp import (
@@ -190,3 +192,57 @@ class TestReplayIntoDP(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMakeBufferSizesAuto(unittest.TestCase):
+    """--total-ratio auto: pick the fitted row matching the served budget, or
+    fall back to uniform when no row is close enough."""
+
+    def _csv(self, tmp):
+        import csv as _csv
+        import json as _json
+
+        path = os.path.join(tmp, "dp_allocations.csv")
+        layers = [0, 1, 2]
+        with open(path, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(
+                [
+                    "total_ratio",
+                    "predicted_uniform_miss_rate",
+                    "predicted_dp_miss_rate",
+                    "kv_budget_derived",
+                ]
+                + [f"layer_{l}" for l in layers]
+            )
+            w.writerow([0.1, 0.08, 0.07, 0, 0.05, 0.1, 0.15])
+            w.writerow([0.2, 0.06, 0.06, 0, 0.15, 0.2, 0.25])
+        with open(os.path.join(tmp, "dp_meta.json"), "w") as f:
+            _json.dump({"mean_slot_ctx0": 100000, "num_layers": 3}, f)
+        return path
+
+    def test_auto_matches_fitted_row(self):
+        from sglang.srt.mem_cache.sparsity.trace.make_buffer_sizes import (
+            read_dp_row,
+            served_total_ratio,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._csv(tmp)
+            served = served_total_ratio(path, b_mean=10240)  # 0.1024
+            ratio, chosen = read_dp_row(path, None, served_ratio=served)
+            self.assertEqual(chosen, 0.1)
+            self.assertEqual(ratio, {0: 0.05, 1: 0.1, 2: 0.15})
+
+    def test_auto_falls_back_to_uniform_when_far(self):
+        from sglang.srt.mem_cache.sparsity.trace.make_buffer_sizes import (
+            read_dp_row,
+            served_total_ratio,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._csv(tmp)
+            served = served_total_ratio(path, b_mean=4096)  # 0.041, >25% from 0.1
+            ratio, chosen = read_dp_row(path, None, served_ratio=served)
+            self.assertAlmostEqual(chosen, 0.04096)
+            self.assertEqual(len(set(ratio.values())), 1)

@@ -314,6 +314,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     csv_path = os.path.join(args.out_dir, "dp_allocations.csv")
     write_dp_allocations_csv(csv_path, rows, layer_ids)
     print(f"Wrote {csv_path}")
+    # Sidecar so make_buffer_sizes --total-ratio auto can map a served buffer
+    # size (slots) onto the ratio grid: ratio = b_mean / mean_slot_ctx0.
+    meta_path = os.path.join(args.out_dir, "dp_meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(
+            {
+                "mean_slot_ctx0": mean_slot_ctx0,
+                "num_layers": num_layers,
+                "num_requests": len(requests),
+                "measure_ratios": list(args.measure_ratios),
+                "total_ratios": [row["total_ratio"] for row in rows],
+            },
+            f,
+            indent=2,
+        )
+    print(f"Wrote {meta_path}")
     for row in rows:
         tag = " [kv-derived]" if row.get("kv_budget_derived") else ""
         print(
