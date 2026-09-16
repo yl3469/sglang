@@ -137,6 +137,11 @@ Measured GLM-FP8 AA-LCR @10240 slots: uniform 6.3% misses vs dp 5.6% (-12%), wor
 copy of tokens `[0, B_l)` once `seq_len > B_l`; the shared rows go back to the pool at `seq_len >= shared_width+2`.
 uniform and dp with equal slot totals are now byte-identical: compare `/server_info` ->
 `internal_states[i].hisparse_buffer_layout.buffer_bytes` and `memory_usage.kvcache` (`.slurm_logs/byte_equality_check.py`).
+Measured (GLM-5.2-FP8 AA-LCR, 10240 slots/layer, 9 request slots/rank): both arms 30.67 GB KV/rank incl. 4.39 GB of
+buffers; dp misses 5.46% vs uniform 6.24%; throughput unchanged vs the shared-row build (56 vs 57 tok/s at c16).
+(o) Iso-miss-rate DP (`run_per_layer_dp --target-miss-rates`, `make_buffer_sizes --target-csv`): fewest buffer rows for
+a target mean miss rate. Measure a FINE `--measure-ratios` grid first - the uniform baseline sits on measured ratios
+only, so a coarse grid overstates the saving (GLM cc-traces: 14-18% rows saved on an 18-point grid vs 37% on 9 points).
 
 ## Architecture
 
