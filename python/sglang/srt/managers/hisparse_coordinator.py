@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
+from sglang.srt.utils.common import is_pin_memory_available
 
 device_module = get_device_module()
 
@@ -40,6 +41,33 @@ class HiSparseTokenStats(NamedTuple):
     device_token_usage: float
     host_tokens: int
     host_token_usage: float
+
+
+def _select_backup_positions(
+    *,
+    seq_lens_cpu: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    skip_first_backup: List[bool],
+    compress_ratio: int,
+) -> List[int]:
+    """Batch positions whose previous compressed token needs a host backup.
+
+    A request is skipped on the first decode step after staging (staging
+    already backed up every prefill token; the flag is cleared here so the
+    skip happens once) and on steps that did not complete a compressed token
+    (``(seq_len - 1) % compress_ratio != 0``). Pure host work on the CPU
+    mirrors of ``seq_lens`` / ``req_pool_indices``.
+    """
+    positions: List[int] = []
+    for i, (req_idx, seq_len) in enumerate(
+        zip(req_pool_indices_cpu.tolist(), seq_lens_cpu.tolist())
+    ):
+        if skip_first_backup[req_idx]:
+            skip_first_backup[req_idx] = False
+            continue
+        if (seq_len - 1) % compress_ratio == 0:
+            positions.append(i)
+    return positions
 
 
 class HiSparseCoordinator:
@@ -62,6 +90,7 @@ class HiSparseCoordinator:
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
         self.device = device
+        self._pin_memory = is_pin_memory_available(device)
         self.swap_in_block_size = swap_in_block_size
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
@@ -503,32 +532,53 @@ class HiSparseCoordinator:
             ] = reserved_buffer_loc
             return
 
-        active_reqs = seq_lens % self.compress_ratio == 0
-        if not torch.any(active_reqs):
-            return
-
-        active_seq_lens = seq_lens[active_reqs]
-        active_out_cache_loc = out_cache_loc[active_reqs]
-        active_req_pool_indices = req_pool_indices[active_reqs]
-
-        compressed_seq_lens = active_seq_lens // self.compress_ratio
-        reserved_positions = (compressed_seq_lens - 1).clamp(
-            max=self.device_buffer_size
+        self._map_last_loc_to_buffer_dsv4(
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            req_pool_indices=req_pool_indices,
         )
-        reserved_buffer_loc = self.req_to_device_buffer[
-            active_req_pool_indices, reserved_positions
+
+    def _map_last_loc_to_buffer_dsv4(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        """DSv4: point the newest compressed token at its reserved buffer slot.
+
+        Only requests whose ``seq_len`` just completed a compressed group
+        ("active") produced a new compressed token. The update is computed
+        for every row and inactive rows rewrite the value already stored, so
+        the scheduler's per-step path has no ``torch.any`` host round trip and
+        no boolean-mask compaction (``nonzero`` -> device sync); the resulting
+        tensors equal those of updating the active rows alone.
+        """
+        active = seq_lens % self.compress_ratio == 0
+        reserved_positions = (seq_lens // self.compress_ratio - 1).clamp(
+            min=0, max=self.device_buffer_size
+        )
+        new_loc = self.req_to_device_buffer[req_pool_indices, reserved_positions]
+
+        reserved_cells = self.req_device_buffer_token_locs[
+            :, req_pool_indices, self.device_buffer_size
         ]
-
         self.req_device_buffer_token_locs[
-            :, active_req_pool_indices, self.device_buffer_size
-        ] = reserved_buffer_loc.to(torch.int32)
+            :, req_pool_indices, self.device_buffer_size
+        ] = torch.where(
+            active[None, :], new_loc.to(torch.int32)[None, :], reserved_cells
+        )
 
+        mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
         compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
-            active_out_cache_loc
+            out_cache_loc
         )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
-            reserved_buffer_loc
-        )
+        # Inactive rows target the trailing sentinel entry (never a real
+        # compressed slot, so they cannot alias an active row's write) and
+        # rewrite its current value.
+        sentinel = torch.full_like(compressed_locs, mapping.shape[0] - 1)
+        target = torch.where(active, compressed_locs, sentinel)
+        mapping[target] = torch.where(active, new_loc, mapping[target])
 
     def _eager_backup_previous_token(
         self,
@@ -549,24 +599,24 @@ class HiSparseCoordinator:
         - Steps where `(seq_len - 1) % compress_ratio != 0`: no new compressed
           token was produced this step.
         """
-        # Build the list of batch positions that need a host backup.
-        # Skip the first decode step after staging (prefill already backed up),
-        # and skip non-aligned steps that did not produce a new compressed token.
-        backup_indices = []
-        for i in range(len(seq_lens_cpu)):
-            req_idx = int(req_pool_indices_cpu[i])
-            if self._skip_first_backup[req_idx]:
-                self._skip_first_backup[req_idx] = False
-                continue
-            if (int(seq_lens_cpu[i]) - 1) % self.compress_ratio == 0:
-                backup_indices.append(i)
-
+        backup_indices = _select_backup_positions(
+            seq_lens_cpu=seq_lens_cpu,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            skip_first_backup=self._skip_first_backup,
+            compress_ratio=self.compress_ratio,
+        )
         if not backup_indices:
             return
 
+        # Pinned staging + non-blocking H2D. A pageable ``torch.tensor(...,
+        # device=cuda)`` is cudaMemcpyAsync + cudaStreamSynchronize on the
+        # schedule stream, which is ordered behind the in-flight forward, so
+        # the scheduler thread stalled until the previous step's graph ended.
+        # The caching host allocator keeps the pinned source alive until the
+        # copy has executed (the copy records an event on the block).
         backup_indices_gpu = torch.tensor(
-            backup_indices, dtype=torch.int64, device=self.device
-        )
+            backup_indices, dtype=torch.int64, pin_memory=self._pin_memory
+        ).to(self.device, non_blocking=True)
         backup_req_indices = req_pool_indices[backup_indices_gpu]
 
         # The previous compressed token's position and its device buffer slot:
